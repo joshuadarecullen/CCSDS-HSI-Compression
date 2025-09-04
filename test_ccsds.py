@@ -13,11 +13,11 @@ Tests the complete compression pipeline including:
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from pathlib import Path
+# from pathlib import Path
 import sys
 
 # Add current directory to path for imports
-sys.path.append(str(Path(__file__).parent))
+# sys.path.append(str(Path(__file__).parent))
 
 from ccsds_compressor import CCSDS123Compressor, create_lossless_compressor, create_near_lossless_compressor
 from predictor import SpectralPredictor
