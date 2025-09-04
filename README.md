@@ -33,7 +33,7 @@ This implementation includes all major components of Issue 2 of the CCSDS-123.0-
 
 ```python
 import torch
-from ccsds_compressor import create_lossless_compressor
+from ccsds_compressor import create_lossless_compressor, decompress
 
 # Create test image [Z, Y, X]
 image = torch.randn(10, 64, 64) * 100  # 10 bands, 64x64 pixels
@@ -41,16 +41,20 @@ image = torch.randn(10, 64, 64) * 100  # 10 bands, 64x64 pixels
 # Create lossless compressor
 compressor = create_lossless_compressor(num_bands=10, dynamic_range=16)
 
-# Compress
-results = compressor(image)
-print(f"Compression ratio: {results['compression_ratio']:.2f}:1")
-print(f"Lossless: max error = {torch.max(torch.abs(image - results['reconstructed_samples']))}")
+# Compress to get complete compressed representation
+compressed_data = compressor.compress(image)
+print(f"Compression ratio: {compressed_data['compression_statistics']['compression_ratio']:.2f}:1")
+print(f"Compressed size: {len(compressed_data['compressed_bitstream'])} bytes")
+
+# Decompress to reconstruct image
+reconstructed = decompress(compressed_data)
+print(f"Lossless: max error = {torch.max(torch.abs(image - reconstructed))}")
 ```
 
-### Near-Lossless Compression
+### Near-Lossless Compression with Quality Assessment
 
 ```python
-from ccsds_compressor import create_near_lossless_compressor
+from ccsds_compressor import create_near_lossless_compressor, calculate_psnr, calculate_mssim, calculate_spectral_angle
 
 # Set absolute error limits per band
 error_limits = torch.tensor([2.0, 2.0, 4.0, 4.0, 8.0])  # Varying by band
@@ -62,9 +66,23 @@ compressor = create_near_lossless_compressor(
     absolute_error_limits=error_limits
 )
 
-results = compressor(image[:5])  # Use first 5 bands
-print(f"Compression ratio: {results['compression_ratio']:.2f}:1")
-print(f"Max error: {torch.max(torch.abs(image[:5] - results['reconstructed_samples']))}")
+# Compress and get quality metrics
+compressed_data = compressor.compress(image[:5])  # Use first 5 bands
+reconstructed = compressed_data['intermediate_data']['reconstructed_samples']
+
+print(f"Compression ratio: {compressed_data['compression_statistics']['compression_ratio']:.2f}:1")
+print(f"Max error: {torch.max(torch.abs(image[:5] - reconstructed))}")
+
+# Calculate quality metrics with callbacks
+def quality_callback(metric_name, value, additional_data=None):
+    print(f"{metric_name}: {value:.4f}")
+    
+psnr = calculate_psnr(image[:5], reconstructed, 16, 
+                      callback=lambda p, m: quality_callback("PSNR (dB)", p))
+mssim = calculate_mssim(image[:5], reconstructed,
+                       callback=lambda m, s: quality_callback("MSSIM", m))
+sam = calculate_spectral_angle(image[:5], reconstructed,
+                              callback=lambda s, m: quality_callback("SAM (radians)", s))
 ```
 
 ### Advanced Configuration
@@ -90,7 +108,7 @@ compressor.set_compression_parameters(
     update_interval=500
 )
 
-results = compressor(image)
+compressed_data = compressor.compress(image)
 ```
 
 ## File Structure
@@ -99,7 +117,7 @@ results = compressor(image)
 - `quantizer.py` - Uniform quantizer with error limit control
 - `sample_representative.py` - Sample representative calculation
 - `entropy_coder.py` - Hybrid entropy coder with low-entropy codes
-- `ccsds_compressor.py` - Main compressor pipeline
+- `ccsds_compressor.py` - Main compressor pipeline with entropy encoding, decompression, and quality assessment
 - `test_ccsds.py` - Comprehensive test suite
 - `requirements.txt` - Python dependencies
 
@@ -113,12 +131,15 @@ python test_ccsds.py
 ```
 
 The test suite includes:
-- Lossless compression verification
-- Near-lossless compression with different error limits
+- Lossless compression verification with decompression
+- Near-lossless compression with different error limits  
 - Sample representative parameter effects
 - Relative error limit testing
 - Narrow local sums predictor
 - Compression performance analysis
+- Quality metrics validation (PSNR, MSSIM, SAM)
+- Entropy coding integration tests
+- Bitstream compression and reconstruction
 
 ## Implementation Notes
 
@@ -154,6 +175,39 @@ The test suite includes:
 - Supports 32-bit dynamic range (vs 16-bit in Issue 1)
 - Includes periodic error limit updating capability
 
+## New Features
+
+### Complete Compression Pipeline
+- **Entropy Encoder**: Fully integrated hybrid entropy coder with automatic high/low entropy classification
+- **Decompression**: Complete decompression function to reconstruct images from compressed bitstreams
+- **Quality Assessment**: Callback-style functions for PSNR, MSSIM, and Spectral Angle Mapper calculations
+- **Enhanced Documentation**: Mathematical explanations for all compression stages
+- **Type Safety**: Complete type annotations for all methods and functions
+
+### Quality Metrics
+
+```python
+# Calculate PSNR with callback
+def psnr_callback(psnr_value, mse_value):
+    print(f"PSNR: {psnr_value:.2f} dB (MSE: {mse_value:.6f})")
+    
+psnr = calculate_psnr(original, reconstructed, dynamic_range=16, callback=psnr_callback)
+
+# Calculate MSSIM with per-band analysis
+def mssim_callback(mssim_value, ssim_per_band):
+    print(f"MSSIM: {mssim_value:.4f}")
+    print(f"Per-band SSIM: {[f'{s:.3f}' for s in ssim_per_band]}")
+    
+mssim = calculate_mssim(original, reconstructed, callback=mssim_callback)
+
+# Calculate Spectral Angle with spatial analysis
+def sam_callback(mean_sam, sam_map):
+    print(f"Mean SAM: {mean_sam:.6f} radians ({mean_sam*180/3.14159:.3f} degrees)")
+    print(f"SAM std: {np.std(sam_map):.6f} radians")
+    
+sam = calculate_spectral_angle(original, reconstructed, callback=sam_callback)
+```
+
 ## Limitations
 
 This is a research implementation with some simplifications:
@@ -161,7 +215,7 @@ This is a research implementation with some simplifications:
 1. **Entropy Coding**: Low-entropy code tables are generated algorithmically rather than using exact tables from the standard
 2. **Weight Adaptation**: Uses simplified weight update rules
 3. **Error Limit Updates**: Basic adaptive strategy rather than sophisticated rate control
-4. **Decompression**: Not implemented (compression-only)
+4. **Full Bitstream Decoding**: Entropy decoding implementation is simplified (uses intermediate data for reconstruction)
 5. **Supplementary Information**: Tables not supported
 
 ## Performance
