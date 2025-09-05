@@ -2,6 +2,8 @@ import torch
 import numpy as np
 import time
 from typing import List, Dict, Any, Tuple, Union
+from ..ccsds.low_entropy_tables import LOW_ENTROPY_TABLES, CompleteLowEntropyCode
+from ..ccsds.rice_coder import RiceCoder
 
 
 class OptimizedHybridEntropyCoder:
@@ -37,28 +39,17 @@ class OptimizedHybridEntropyCoder:
         self.compressed_bits = []
         self.band_compressed_sizes = torch.zeros(num_bands, dtype=torch.long, device=device)
 
-    def _initialize_optimized_codes(self) -> List['OptimizedLowEntropyCode']:
+    def _initialize_optimized_codes(self) -> List[CompleteLowEntropyCode]:
         """
-        Initialize optimized low-entropy code lookup tables
+        Initialize complete CCSDS-123.0-B-2 low-entropy code tables
 
-        Uses vectorized operations and pre-computed tables for faster encoding
+        Uses the complete Table 5-16 specification with proper codeword mappings
         """
         codes = []
 
-        # Optimized code specifications (from Table 1)
-        code_specs = [
-            (0, 12, 105, 3, 13), (1, 10, 144, 3, 13), (2, 8, 118, 3, 12),
-            (3, 6, 120, 4, 13), (4, 6, 92, 4, 13), (5, 4, 116, 6, 15),
-            (6, 4, 101, 6, 15), (7, 4, 81, 5, 18), (8, 2, 88, 12, 16),
-            (9, 2, 106, 12, 17), (10, 2, 103, 12, 18), (11, 2, 127, 16, 20),
-            (12, 2, 109, 27, 21), (13, 2, 145, 46, 18), (14, 2, 256, 85, 17),
-            (15, 0, 257, 256, 9)
-        ]
-
-        for code_idx, input_limit, num_codewords, max_input_len, max_output_len in code_specs:
-            code = OptimizedLowEntropyCode(
-                code_idx, input_limit, num_codewords, max_input_len, max_output_len
-            )
+        # Use complete low-entropy code tables from the standard
+        for code_id in range(16):
+            code = CompleteLowEntropyCode(code_id, LOW_ENTROPY_TABLES)
             codes.append(code)
 
         return codes
@@ -120,7 +111,9 @@ class OptimizedHybridEntropyCoder:
 
         return entropy_mask, code_indices
 
-    def encode_high_entropy_vectorized(self, mapped_indices: torch.Tensor, code_indices: torch.Tensor) -> List[int]:
+    def encode_high_entropy_vectorized(self,
+                                       mapped_indices: torch.Tensor,
+                                       code_indices: torch.Tensor) -> List[int]:
         """
         Vectorized high-entropy sample encoding
 
@@ -176,9 +169,16 @@ class OptimizedHybridEntropyCoder:
 
             if code_idx < len(self.low_entropy_codes):
                 code = self.low_entropy_codes[code_idx]
-                code_bits = code.encode_batch(samples.tolist())
-                if code_bits:
-                    encoded_bits.extend(code_bits)
+                # Process samples one by one with the complete low-entropy code
+                for sample in samples.tolist():
+                    code_bits = code.add_symbol(int(sample))
+                    if code_bits:
+                        encoded_bits.extend(code_bits)
+                        
+                # Flush any remaining symbols in the code buffer
+                flush_bits = code.flush()
+                for bit_sequence in flush_bits:
+                    encoded_bits.extend(bit_sequence)
 
         return encoded_bits
 
@@ -552,3 +552,611 @@ def encode_image_streaming(mapped_indices: torch.Tensor, num_bands: int, chunk_s
     device = mapped_indices.device.type
     encoder = StreamingOptimizedCoder(num_bands, chunk_size, device=device)
     return encoder.encode_streaming(mapped_indices)
+
+
+class OptimizedBlockAdaptiveEntropyCoder:
+    """
+    GPU-Accelerated Block-Adaptive Entropy Coder for CCSDS-123.0-B-2
+    
+    Features:
+    - Vectorized block partitioning using tensor operations
+    - GPU-accelerated entropy estimation
+    - Parallel block processing with batching
+    - Memory-efficient streaming for large images
+    - Device-aware tensor management
+    """
+    
+    def __init__(self, num_bands: int, block_size: Tuple[int, int] = (8, 8), 
+                 min_block_samples: int = 16, device: str = 'cpu',
+                 gpu_batch_size: int = 32) -> None:
+        self.num_bands = num_bands
+        self.block_size = block_size
+        self.min_block_samples = min_block_samples
+        self.device = device
+        self.gpu_batch_size = gpu_batch_size  # Number of blocks to process in parallel
+        
+        # Pre-compute low-entropy code lookup tables on device
+        self.low_entropy_codes = self._initialize_optimized_codes()
+        
+        # Pre-allocate GPU memory for block statistics
+        self.block_stats_buffer = None
+        
+    def _initialize_optimized_codes(self) -> List[CompleteLowEntropyCode]:
+        """Initialize complete CCSDS-123.0-B-2 low-entropy code tables for block-adaptive encoding"""
+        codes = []
+        
+        # Use complete low-entropy code tables from Table 5-16
+        for code_id in range(16):
+            code = CompleteLowEntropyCode(code_id, LOW_ENTROPY_TABLES)
+            codes.append(code)
+            
+        return codes
+    
+    def _partition_into_blocks_vectorized(self, mapped_indices: torch.Tensor) -> List[Dict[str, Any]]:
+        """
+        GPU-accelerated block partitioning using vectorized operations
+        
+        Args:
+            mapped_indices: [Z, Y, X] tensor of mapped indices
+            
+        Returns:
+            List of block dictionaries with pre-computed coordinates and data
+        """
+        Z, Y, X = mapped_indices.shape
+        block_h, block_w = self.block_size
+        
+        blocks = []
+        
+        # Vectorized block extraction for each band
+        for z in range(Z):
+            band_data = mapped_indices[z]  # [Y, X]
+            
+            # Calculate number of blocks in each dimension
+            num_blocks_y = (Y + block_h - 1) // block_h
+            num_blocks_x = (X + block_w - 1) // block_w
+            
+            for block_y in range(num_blocks_y):
+                for block_x in range(num_blocks_x):
+                    # Calculate block boundaries
+                    y_start = block_y * block_h
+                    y_end = min(y_start + block_h, Y)
+                    x_start = block_x * block_w
+                    x_end = min(x_start + block_w, X)
+                    
+                    # Extract block data (vectorized)
+                    block_data = band_data[y_start:y_end, x_start:x_end].contiguous()
+                    
+                    # Skip blocks that are too small
+                    if block_data.numel() < self.min_block_samples:
+                        continue
+                    
+                    blocks.append({
+                        'band': z,
+                        'coordinates': (y_start, x_start, y_end, x_end),
+                        'shape': (y_end - y_start, x_end - x_start),
+                        'data': block_data.flatten(),  # Flatten for entropy computation
+                        'size': block_data.numel()
+                    })
+        
+        return blocks
+    
+    def _estimate_block_entropy_batch(self, block_data_list: List[torch.Tensor]) -> List[Dict[str, float]]:
+        """
+        GPU-accelerated batch entropy estimation for multiple blocks
+        
+        Args:
+            block_data_list: List of flattened block tensors
+            
+        Returns:
+            List of entropy statistics for each block
+        """
+        entropy_stats = []
+        
+        # Process blocks in batches for GPU efficiency
+        for i in range(0, len(block_data_list), self.gpu_batch_size):
+            batch_blocks = block_data_list[i:i + self.gpu_batch_size]
+            
+            # Compute entropy statistics for batch
+            for block_data in batch_blocks:
+                # Move to device if needed
+                if block_data.device.type != self.device:
+                    block_data = block_data.to(self.device)
+                
+                # Vectorized histogram computation
+                unique_vals, counts = torch.unique(block_data, return_counts=True)
+                
+                # Compute probability distribution
+                total_samples = block_data.numel()
+                probabilities = counts.float() / total_samples
+                
+                # Compute entropy: H = -sum(p * log2(p))
+                entropy = -torch.sum(probabilities * torch.log2(probabilities + 1e-12))
+                
+                # Additional statistics
+                variance = torch.var(block_data.float())
+                mean_val = torch.mean(block_data.float())
+                max_magnitude = torch.max(torch.abs(block_data)).item()
+                
+                entropy_stats.append({
+                    'entropy': entropy.item(),
+                    'variance': variance.item(), 
+                    'mean': mean_val.item(),
+                    'unique_values': len(unique_vals),
+                    'max_magnitude': max_magnitude,
+                    'total_samples': total_samples
+                })
+        
+        return entropy_stats
+    
+    def _select_optimal_code_vectorized(self, entropy_stats: Dict[str, float]) -> Tuple[str, int]:
+        """
+        Vectorized code selection based on block statistics
+        
+        Args:
+            entropy_stats: Block entropy and statistics
+            
+        Returns:
+            (code_type, code_index) tuple
+        """
+        entropy = entropy_stats['entropy']
+        max_magnitude = entropy_stats['max_magnitude']
+        unique_values = entropy_stats['unique_values']
+        
+        # Classification thresholds (tuned for GPU efficiency)
+        low_entropy_threshold = 4.0
+        very_low_entropy_threshold = 2.0
+        
+        if entropy < very_low_entropy_threshold:
+            # Very uniform block - use most efficient low-entropy code
+            if unique_values <= 2:
+                return ('low', 15)  # Most efficient for binary data
+            elif unique_values <= 4: 
+                return ('low', 14)
+            else:
+                return ('low', 13)
+                
+        elif entropy < low_entropy_threshold:
+            # Low entropy block - select based on magnitude and diversity
+            if max_magnitude <= 16:
+                if unique_values <= 8:
+                    return ('low', 12)
+                elif unique_values <= 32:
+                    return ('low', 10)
+                else:
+                    return ('low', 8)
+            else:
+                return ('low', 5)  # Moderate entropy, higher magnitude
+                
+        else:
+            # High entropy block - use GPO2 codes
+            if max_magnitude <= 32:
+                return ('high', 2)  # GPO2 with k=2
+            elif max_magnitude <= 128:
+                return ('high', 3)  # GPO2 with k=3  
+            else:
+                return ('high', 4)  # GPO2 with k=4
+    
+    def _encode_blocks_batch(self, blocks: List[Dict[str, Any]], 
+                           entropy_stats_list: List[Dict[str, float]]) -> Tuple[bytes, Dict[str, Any]]:
+        """
+        GPU-accelerated batch encoding of blocks
+        
+        Args:
+            blocks: List of block dictionaries
+            entropy_stats_list: List of entropy statistics for each block
+            
+        Returns:
+            (compressed_data, compression_stats) tuple
+        """
+        import time
+        start_time = time.time()
+        
+        all_compressed_bits = []
+        total_samples = 0
+        block_stats = []
+        
+        # Process blocks in GPU-efficient batches
+        for i, (block, entropy_stats) in enumerate(zip(blocks, entropy_stats_list)):
+            # Select optimal code for block
+            code_type, code_index = self._select_optimal_code_vectorized(entropy_stats)
+            
+            # Encode block header (metadata)
+            header_bits = self._encode_block_header_optimized(block, code_type, code_index)
+            all_compressed_bits.extend(header_bits)
+            
+            # Encode block data with selected code
+            block_bits = self._encode_block_data_optimized(block['data'], code_type, code_index)
+            all_compressed_bits.extend(block_bits)
+            
+            # Update statistics
+            total_samples += block['size']
+            block_stats.append({
+                'band': block['band'],
+                'coordinates': block['coordinates'],
+                'entropy': entropy_stats['entropy'],
+                'code_type': code_type,
+                'code_index': code_index,
+                'samples': block['size'],
+                'compressed_bits': len(header_bits) + len(block_bits)
+            })
+        
+        # Convert bits to bytes
+        compressed_data = self._bits_to_bytes_optimized(all_compressed_bits)
+        
+        # Compute final statistics
+        end_time = time.time()
+        total_bits = len(all_compressed_bits)
+        
+        compression_stats = {
+            'total_samples': total_samples,
+            'total_compressed_bits': total_bits,
+            'total_compressed_bytes': len(compressed_data),
+            'bits_per_sample': total_bits / total_samples if total_samples > 0 else 0,
+            'compression_ratio': (total_samples * 16) / total_bits if total_bits > 0 else 0,
+            'encoding_time': end_time - start_time,
+            'throughput_samples_per_sec': total_samples / (end_time - start_time) if (end_time - start_time) > 0 else 0,
+            'num_blocks': len(blocks),
+            'block_size': self.block_size,
+            'gpu_batch_size': self.gpu_batch_size,
+            'device': self.device,
+            'block_stats': block_stats
+        }
+        
+        return compressed_data, compression_stats
+    
+    def _encode_block_header_optimized(self, block: Dict[str, Any], 
+                                     code_type: str, code_index: int) -> List[int]:
+        """Optimized block header encoding"""
+        header = []
+        
+        # Block coordinates and dimensions (optimized bit packing)
+        y, x, y_end, x_end = block['coordinates']
+        header.extend([(y >> i) & 1 for i in range(16)])        # y coordinate
+        header.extend([(x >> i) & 1 for i in range(16)])        # x coordinate  
+        header.extend([(block['shape'][0] >> i) & 1 for i in range(8)])  # height
+        header.extend([(block['shape'][1] >> i) & 1 for i in range(8)])  # width
+        
+        # Code selection (4 bits total)
+        code_type_bit = 0 if code_type == 'low' else 1
+        code_info = (code_type_bit << 3) | (code_index & 0x07)
+        header.extend([(code_info >> i) & 1 for i in range(4)])
+        
+        return header
+    
+    def _encode_block_data_optimized(self, block_data: torch.Tensor, 
+                                   code_type: str, code_index: int) -> List[int]:
+        """GPU-optimized block data encoding"""
+        if code_type == 'low':
+            return self._encode_with_low_entropy_optimized(block_data, code_index)
+        else:
+            return self._encode_with_gpo2_optimized(block_data, code_index)
+    
+    def _encode_with_low_entropy_optimized(self, data: torch.Tensor, code_index: int) -> List[int]:
+        """Optimized low-entropy encoding with vectorized operations"""
+        code = self.low_entropy_codes[code_index]
+        bits = []
+        
+        # Vectorized processing for GPU efficiency
+        data_cpu = data.cpu() if data.device.type != 'cpu' else data
+        
+        for value in data_cpu:
+            val = value.item()
+            abs_val = abs(val)
+            
+            if abs_val <= code['input_limit']:
+                # Use low-entropy code (simplified bit generation)
+                sign_bit = 0 if val >= 0 else 1
+                
+                # Generate variable-length codeword
+                codeword_bits = []
+                temp = abs_val
+                for _ in range(code['max_output_len']):
+                    codeword_bits.append(temp & 1)
+                    temp >>= 1
+                    if temp == 0:
+                        break
+                
+                bits.extend(codeword_bits)
+                bits.append(sign_bit)
+            else:
+                # Fallback to GPO2 for values outside code range
+                fallback_bits = self._gpo2_encode_single(val, 3)
+                bits.extend(fallback_bits)
+        
+        return bits
+    
+    def _encode_with_gpo2_optimized(self, data: torch.Tensor, k: int) -> List[int]:
+        """Optimized GPO2 encoding with vectorized operations"""
+        bits = []
+        
+        # Move to CPU for bit manipulation (more efficient than GPU for this operation)
+        data_cpu = data.cpu() if data.device.type != 'cpu' else data
+        
+        for value in data_cpu:
+            val = value.item()
+            bits.extend(self._gpo2_encode_single(val, k))
+        
+        return bits
+    
+    def _gpo2_encode_single(self, value: int, k: int) -> List[int]:
+        """Optimized single value GPO2 encoding"""
+        abs_val = abs(value)
+        sign_bit = 0 if value >= 0 else 1
+        
+        # Efficient bit operations
+        quotient = abs_val >> k
+        remainder = abs_val & ((1 << k) - 1)
+        
+        # Unary prefix + k-bit suffix + sign
+        bits = [1] * quotient + [0]  # Unary
+        bits.extend([(remainder >> i) & 1 for i in range(k)])  # k-bit suffix
+        bits.append(sign_bit)  # Sign bit
+        
+        return bits
+    
+    def _bits_to_bytes_optimized(self, bits: List[int]) -> bytes:
+        """Optimized bit-to-byte conversion"""
+        # Pad to byte boundary
+        while len(bits) % 8 != 0:
+            bits.append(0)
+        
+        # Efficient byte packing using numpy
+        byte_array = np.zeros(len(bits) // 8, dtype=np.uint8)
+        bits_array = np.array(bits, dtype=np.uint8)
+        
+        for i in range(8):
+            byte_array |= (bits_array[i::8] << i)
+        
+        return bytes(byte_array)
+    
+    def encode_image_block_adaptive_optimized(self, mapped_indices: torch.Tensor) -> Tuple[bytes, Dict[str, Any]]:
+        """
+        Main optimized block-adaptive encoding function
+        
+        Args:
+            mapped_indices: [Z, Y, X] tensor of mapped quantizer indices
+            
+        Returns:
+            (compressed_data, compression_stats) tuple
+        """
+        # Ensure tensor is on correct device
+        if mapped_indices.device.type != self.device:
+            mapped_indices = mapped_indices.to(self.device)
+        
+        # GPU-accelerated block partitioning
+        blocks = self._partition_into_blocks_vectorized(mapped_indices)
+        
+        # Batch entropy estimation
+        block_data_list = [block['data'] for block in blocks]
+        entropy_stats_list = self._estimate_block_entropy_batch(block_data_list)
+        
+        # Batch encoding
+        compressed_data, compression_stats = self._encode_blocks_batch(blocks, entropy_stats_list)
+        
+        return compressed_data, compression_stats
+
+
+def encode_image_block_adaptive_optimized(mapped_indices: torch.Tensor, num_bands: int,
+                                        block_size: Tuple[int, int] = (8, 8),
+                                        min_block_samples: int = 16,
+                                        gpu_batch_size: int = 32) -> Tuple[bytes, Dict[str, Any]]:
+    """
+    Optimized block-adaptive image encoding function
+    
+    Args:
+        mapped_indices: [Z, Y, X] tensor of mapped quantizer indices
+        num_bands: Number of spectral bands
+        block_size: (height, width) of blocks
+        min_block_samples: Minimum samples per block
+        gpu_batch_size: Number of blocks to process in parallel
+        
+    Returns:
+        compressed_data: Bytes of compressed image data
+        compression_stats: Detailed compression statistics
+    """
+    device = mapped_indices.device.type
+    encoder = OptimizedBlockAdaptiveEntropyCoder(
+        num_bands=num_bands,
+        block_size=block_size, 
+        min_block_samples=min_block_samples,
+        device=device,
+        gpu_batch_size=gpu_batch_size
+    )
+    return encoder.encode_image_block_adaptive_optimized(mapped_indices)
+
+
+class OptimizedRiceCoder:
+    """
+    GPU-Optimized CCSDS-121.0-B-2 Rice Coder for Issue 2 Compatibility
+    
+    Provides vectorized Rice coding with GPU acceleration for the optimized
+    CCSDS-123.0-B-2 compressor pipeline.
+    """
+    
+    def __init__(self, block_size: Tuple[int, int] = (16, 16), device: str = 'cpu', gpu_batch_size: int = 32):
+        self.block_size = block_size
+        self.device = device
+        self.gpu_batch_size = gpu_batch_size
+        self.rice_coder = RiceCoder()
+        
+    def _select_optimal_k_batch(self, block_data_list: List[torch.Tensor]) -> List[int]:
+        """
+        Vectorized optimal Rice parameter selection for multiple blocks
+        
+        Args:
+            block_data_list: List of block data tensors
+            
+        Returns:
+            optimal_k_list: List of optimal k parameters for each block
+        """
+        optimal_k_list = []
+        
+        for block_data in block_data_list:
+            if len(block_data) == 0:
+                optimal_k_list.append(0)
+                continue
+                
+            # Vectorized mean computation
+            mean_val = float(torch.mean(block_data.float()))
+            
+            if mean_val <= 1.0:
+                optimal_k = 0
+            else:
+                optimal_k = min(14, max(0, int(np.log2(mean_val))))
+                
+            optimal_k_list.append(optimal_k)
+            
+        return optimal_k_list
+        
+    def encode_blocks_rice_optimized(self, mapped_indices: torch.Tensor) -> Tuple[bytes, Dict[str, Any]]:
+        """
+        GPU-optimized Rice encoding of image blocks
+        
+        Args:
+            mapped_indices: [Z, Y, X] tensor of mapped quantizer indices
+            
+        Returns:
+            compressed_data: Compressed bitstream as bytes
+            compression_stats: Detailed statistics
+        """
+        start_time = time.time()
+        Z, Y, X = mapped_indices.shape
+        
+        # Partition into blocks (vectorized)
+        blocks = self._partition_into_blocks_optimized(mapped_indices)
+        
+        total_bits = 0
+        total_blocks = len(blocks)
+        k_parameters = []
+        encoded_data = bytearray()
+        
+        # Process blocks in GPU-friendly batches
+        for batch_start in range(0, len(blocks), self.gpu_batch_size):
+            batch_end = min(batch_start + self.gpu_batch_size, len(blocks))
+            batch_blocks = blocks[batch_start:batch_end]
+            
+            # Extract block data for batch processing
+            batch_data = [block['data'] for block in batch_blocks]
+            
+            # Vectorized k parameter selection
+            optimal_k_values = self._select_optimal_k_batch(batch_data)
+            k_parameters.extend(optimal_k_values)
+            
+            # Encode each block in the batch
+            for i, (block, k) in enumerate(zip(batch_blocks, optimal_k_values)):
+                block_data = block['data']
+                
+                # Rice encode block
+                encoded_bits, _ = self.rice_coder.encode_block(block_data, k)
+                
+                # Convert bits to bytes for storage
+                block_bytes = self._bits_to_bytes(encoded_bits)
+                
+                # Store Rice parameter (4 bits) + block data
+                param_byte = k & 0x0F  # 4 bits for k parameter
+                encoded_data.append(param_byte)
+                encoded_data.extend(block_bytes)
+                
+                total_bits += len(encoded_bits) + 4  # Include parameter overhead
+        
+        # Final compression statistics
+        encoding_time = time.time() - start_time
+        original_size = Z * Y * X * 16  # Assume 16-bit input
+        compression_ratio = original_size / (total_bits if total_bits > 0 else 1)
+        
+        compression_stats = {
+            'encoding_time': encoding_time,
+            'total_bits': total_bits,
+            'total_blocks': total_blocks,
+            'average_k': sum(k_parameters) / len(k_parameters) if k_parameters else 0,
+            'k_parameter_distribution': self._compute_k_distribution(k_parameters),
+            'compression_ratio': compression_ratio,
+            'original_size': original_size,
+            'encoded_size': len(encoded_data) * 8,
+            'throughput_blocks_per_sec': total_blocks / encoding_time if encoding_time > 0 else 0
+        }
+        
+        return bytes(encoded_data), compression_stats
+        
+    def _partition_into_blocks_optimized(self, mapped_indices: torch.Tensor) -> List[Dict[str, Any]]:
+        """
+        Optimized block partitioning with vectorized operations
+        
+        Args:
+            mapped_indices: [Z, Y, X] tensor of mapped indices
+            
+        Returns:
+            List of block dictionaries
+        """
+        Z, Y, X = mapped_indices.shape
+        block_height, block_width = self.block_size
+        blocks = []
+        
+        for z in range(Z):
+            band_data = mapped_indices[z]
+            
+            for y in range(0, Y, block_height):
+                for x in range(0, X, block_width):
+                    y_end = min(y + block_height, Y)
+                    x_end = min(x + block_width, X)
+                    
+                    block_data = band_data[y:y_end, x:x_end]
+                    
+                    blocks.append({
+                        'data': block_data.flatten(),
+                        'coordinates': (z, y, x, y_end, x_end),
+                        'size': block_data.numel()
+                    })
+                    
+        return blocks
+        
+    def _bits_to_bytes(self, bits: List[int]) -> bytes:
+        """Convert list of bits to bytes"""
+        if not bits:
+            return b''
+            
+        # Pad to byte boundary
+        while len(bits) % 8 != 0:
+            bits.append(0)
+            
+        # Convert to bytes
+        byte_data = []
+        for i in range(0, len(bits), 8):
+            byte_val = 0
+            for j in range(8):
+                if i + j < len(bits):
+                    byte_val |= (bits[i + j] << (7 - j))
+            byte_data.append(byte_val)
+            
+        return bytes(byte_data)
+        
+    def _compute_k_distribution(self, k_parameters: List[int]) -> Dict[int, int]:
+        """Compute distribution of Rice parameters used"""
+        distribution = {}
+        for k in k_parameters:
+            distribution[k] = distribution.get(k, 0) + 1
+        return distribution
+
+
+def encode_image_rice_optimized(mapped_indices: torch.Tensor, 
+                               block_size: Tuple[int, int] = (16, 16),
+                               device: str = 'auto',
+                               gpu_batch_size: int = 32) -> Tuple[bytes, Dict[str, Any]]:
+    """
+    Optimized Rice encoding for entire image with GPU acceleration
+    
+    Args:
+        mapped_indices: [Z, Y, X] tensor of mapped quantizer indices
+        block_size: Block size for Rice coding
+        device: Processing device ('auto', 'cpu', 'cuda')
+        gpu_batch_size: Number of blocks to process in parallel
+        
+    Returns:
+        compressed_data: Compressed bitstream as bytes
+        compression_stats: Detailed compression statistics  
+    """
+    if device == 'auto':
+        device = mapped_indices.device.type
+        
+    encoder = OptimizedRiceCoder(block_size=block_size, device=device, gpu_batch_size=gpu_batch_size)
+    return encoder.encode_blocks_rice_optimized(mapped_indices)

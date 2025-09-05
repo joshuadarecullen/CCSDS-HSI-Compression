@@ -5,7 +5,7 @@ This module implements standard quality metrics used to evaluate
 the performance of lossy and near-lossless image compression:
 
 - PSNR (Peak Signal-to-Noise Ratio)
-- MSSIM (Mean Structural Similarity Index Measure)  
+- MSSIM (Mean Structural Similarity Index Measure)
 - SAM (Spectral Angle Mapper)
 
 All functions support callback functions for custom result handling.
@@ -107,7 +107,7 @@ def calculate_mssim(original: torch.Tensor, reconstructed: torch.Tensor,
         ssim_values.append(ssim_band.item())
 
     mssim = float(np.mean(ssim_values))
-    
+
     if callback is not None:
         callback(mssim, ssim_values)
 
@@ -166,10 +166,10 @@ def calculate_spectral_angle(original: torch.Tensor, reconstructed: torch.Tensor
                 sam_values.append(0.0)
 
     mean_sam = float(np.mean(sam_values)) if sam_values else 0.0
-    
+
     # Create sam_map for callback
     sam_map = np.array(sam_values).reshape(Y, X) if sam_values else np.zeros((Y, X))
-    
+
     if callback is not None:
         callback(mean_sam, sam_map)
 

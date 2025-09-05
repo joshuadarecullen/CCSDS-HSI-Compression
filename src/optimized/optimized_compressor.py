@@ -1,14 +1,27 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union, List, Any
 import time
 from torch.cuda.amp import autocast, GradScaler
 
 from .optimized_predictor import OptimizedSpectralPredictor, CausalOptimizedPredictor
 from .optimized_quantizer import OptimizedUniformQuantizer, OptimizedLosslessQuantizer
-from ..ccsds.sample_representative import OptimizedSampleRepresentative
-from .optimized_entropy_coder import encode_image_optimized, encode_image_streaming, OptimizedHybridEntropyCoder
+try:
+    from ccsds.sample_representative import OptimizedSampleRepresentative
+    from ccsds.header import CCSDS123Header, PredictorMode, EncodingOrder, SupplementaryTable, TableType, TableDimension
+    from ccsds.bitstream import BitstreamFormatter
+    from ccsds.encoding_orders import SampleIterator, EncodingOrderOptimizer
+except ImportError:
+    # Fallback to relative imports
+    from ..ccsds.sample_representative import OptimizedSampleRepresentative
+    from ..ccsds.header import CCSDS123Header, PredictorMode, EncodingOrder, SupplementaryTable, TableType, TableDimension
+    from ..ccsds.bitstream import BitstreamFormatter
+    from ..ccsds.encoding_orders import SampleIterator, EncodingOrderOptimizer
+
+from .optimized_entropy_coder import (encode_image_optimized, encode_image_streaming,
+                                     OptimizedHybridEntropyCoder, encode_image_block_adaptive_optimized,
+                                     OptimizedBlockAdaptiveEntropyCoder, encode_image_rice_optimized)
 
 
 class OptimizedCCSDS123Compressor(nn.Module):
@@ -92,6 +105,16 @@ class OptimizedCCSDS123Compressor(nn.Module):
         self._last_compression_time = 0.0
         self._last_throughput = 0.0
 
+        # Periodic error limit updating for near-lossless compression
+        self.periodic_error_updating = False  # Can be enabled via configuration
+        self.error_update_interval = 1000  # Update every N samples
+        self.error_adaptation_rate = 0.1   # Adaptation rate for error limits
+        self._compression_stats_buffer = {
+            'prediction_errors': [],
+            'quantization_indices': [],
+            'sample_count': 0
+        }
+
         # Optimized entropy coder
         self.entropy_coder = OptimizedHybridEntropyCoder(num_bands, device=self.device)
 
@@ -105,9 +128,16 @@ class OptimizedCCSDS123Compressor(nn.Module):
             'sample_rep_phi': None,
             'sample_rep_psi': None,
             'sample_rep_theta': 4.0,
-            'entropy_coder_type': 'optimized_hybrid',  # 'optimized_hybrid', 'streaming'
+            'entropy_coder_type': 'optimized_hybrid',  # 'optimized_hybrid', 'streaming', 'optimized_block_adaptive', 'optimized_rice'
             'streaming_chunk_size': (4, 32, 32),
             'gpu_batch_size': 8,  # Number of bands to process in parallel on GPU
+            # Block-adaptive entropy coding parameters
+            'block_size': (8, 8),  # (height, width) of blocks
+            'min_block_samples': 16,  # Minimum samples per block
+            'block_gpu_batch_size': 32,  # Number of blocks to process in parallel
+            # Rice coder parameters
+            'rice_block_size': (16, 16),  # (height, width) of Rice coding blocks
+            'rice_gpu_batch_size': 32  # Number of Rice blocks to process in parallel
         }
 
     def _setup_gpu_memory(self):
@@ -312,7 +342,9 @@ class OptimizedCCSDS123Compressor(nn.Module):
         compressed_size = 0
         entropy_stats = {}
 
-        if self.compression_params.get('entropy_coder_type', 'optimized_hybrid') == 'streaming':
+        entropy_coder_type = self.compression_params.get('entropy_coder_type', 'optimized_hybrid')
+
+        if entropy_coder_type == 'streaming':
             # Use streaming entropy coder for large images
             try:
                 chunk_size = self.compression_params.get('streaming_chunk_size', (4, 32, 32))
@@ -321,6 +353,37 @@ class OptimizedCCSDS123Compressor(nn.Module):
             except Exception as e:
                 print(f"Warning: Streaming entropy coding failed ({e}), using fallback")
                 compressed_size = int(torch.mean(mapped_indices.float()) * Z * Y * X * 4)
+
+        elif entropy_coder_type == 'optimized_block_adaptive':
+            # Use optimized block-adaptive entropy coding
+            try:
+                block_size = self.compression_params.get('block_size', (8, 8))
+                min_block_samples = self.compression_params.get('min_block_samples', 16)
+                gpu_batch_size = self.compression_params.get('block_gpu_batch_size', 32)
+
+                compressed_data, entropy_stats = encode_image_block_adaptive_optimized(
+                    mapped_indices, self.num_bands, block_size, min_block_samples, gpu_batch_size
+                )
+                compressed_size = entropy_stats.get('total_compressed_bits', 0)
+            except Exception as e:
+                print(f"Warning: Optimized block-adaptive entropy coding failed ({e}), using fallback")
+                compressed_size = int(torch.mean(mapped_indices.float()) * Z * Y * X * 4)
+
+        elif entropy_coder_type == 'optimized_rice':
+            # Use optimized Rice coder (Issue 2 feature)
+            try:
+                rice_block_size = self.compression_params.get('rice_block_size', (16, 16))
+                rice_gpu_batch_size = self.compression_params.get('rice_gpu_batch_size', 32)
+
+                compressed_data, entropy_stats = encode_image_rice_optimized(
+                    mapped_indices, block_size=rice_block_size,
+                    device=self.device.type, gpu_batch_size=rice_gpu_batch_size
+                )
+                compressed_size = entropy_stats.get('total_bits', 0)
+            except Exception as e:
+                print(f"Warning: Optimized Rice entropy coding failed ({e}), using fallback")
+                compressed_size = int(torch.mean(mapped_indices.float()) * Z * Y * X * 4)
+
         else:
             # Use standard optimized hybrid entropy coder
             try:
@@ -379,15 +442,60 @@ class OptimizedCCSDS123Compressor(nn.Module):
         else:
             sample_representatives = reconstructed_samples
 
-        # Optimized entropy coding
+        # Configurable entropy coding (same as other forward methods)
         compressed_size = 0
         entropy_stats = {}
-        try:
-            compressed_data, entropy_stats = encode_image_optimized(mapped_indices, self.num_bands)
-            compressed_size = len(compressed_data) * 8
-        except Exception as e:
-            print(f"Warning: Optimized entropy coding failed ({e}), using fallback")
-            compressed_size = int(torch.mean(mapped_indices.float()) * Z * Y * X)
+
+        entropy_coder_type = self.compression_params.get('entropy_coder_type', 'optimized_hybrid')
+
+        if entropy_coder_type == 'streaming':
+            # Use streaming entropy coder for large images
+            try:
+                chunk_size = self.compression_params.get('streaming_chunk_size', (4, 32, 32))
+                compressed_data, entropy_stats = encode_image_streaming(mapped_indices, self.num_bands, chunk_size)
+                compressed_size = len(compressed_data) * 8
+            except Exception as e:
+                print(f"Warning: Streaming entropy coding failed ({e}), using fallback")
+                compressed_size = int(torch.mean(mapped_indices.float()) * Z * Y * X * 4)
+
+        elif entropy_coder_type == 'optimized_block_adaptive':
+            # Use optimized block-adaptive entropy coding
+            try:
+                block_size = self.compression_params.get('block_size', (8, 8))
+                min_block_samples = self.compression_params.get('min_block_samples', 16)
+                gpu_batch_size = self.compression_params.get('block_gpu_batch_size', 32)
+
+                compressed_data, entropy_stats = encode_image_block_adaptive_optimized(
+                    mapped_indices, self.num_bands, block_size, min_block_samples, gpu_batch_size
+                )
+                compressed_size = entropy_stats.get('total_compressed_bits', 0)
+            except Exception as e:
+                print(f"Warning: Optimized block-adaptive entropy coding failed ({e}), using fallback")
+                compressed_size = int(torch.mean(mapped_indices.float()) * Z * Y * X * 4)
+
+        elif entropy_coder_type == 'optimized_rice':
+            # Use optimized Rice coder (Issue 2 feature)
+            try:
+                rice_block_size = self.compression_params.get('rice_block_size', (16, 16))
+                rice_gpu_batch_size = self.compression_params.get('rice_gpu_batch_size', 32)
+
+                compressed_data, entropy_stats = encode_image_rice_optimized(
+                    mapped_indices, block_size=rice_block_size,
+                    device=self.device.type, gpu_batch_size=rice_gpu_batch_size
+                )
+                compressed_size = entropy_stats.get('total_bits', 0)
+            except Exception as e:
+                print(f"Warning: Optimized Rice entropy coding failed ({e}), using fallback")
+                compressed_size = int(torch.mean(mapped_indices.float()) * Z * Y * X * 4)
+
+        else:
+            # Use standard optimized hybrid entropy coder
+            try:
+                compressed_data, entropy_stats = encode_image_optimized(mapped_indices, self.num_bands)
+                compressed_size = len(compressed_data) * 8
+            except Exception as e:
+                print(f"Warning: Optimized entropy coding failed ({e}), using fallback")
+                compressed_size = int(torch.mean(mapped_indices.float()) * Z * Y * X * 4)
 
         # Performance tracking
         end_time = time.time()
@@ -616,20 +724,527 @@ class OptimizedCCSDS123Compressor(nn.Module):
             'throughput_megasamples_per_second': self._last_throughput / 1e6,
         }
 
-    def compress(self, image: torch.Tensor) -> bytes:
+    def compress(self, image: torch.Tensor, entropy_coder_type: str = None) -> bytes:
         """
-        Compress image and return compressed bitstream
+        Compress image and return CCSDS-123.0-B-2 compliant compressed bitstream
+
+        Args:
+            image: Input image tensor [Z, Y, X] or [1, Z, Y, X]
+            entropy_coder_type: Override entropy coder type ('optimized_hybrid', 'optimized_block_adaptive',
+                               'optimized_rice', 'streaming', or None to use configured default)
+
+        Returns:
+            compressed_bitstream: CCSDS-123.0-B-2 compliant compressed image as bytes
         """
         results = self.forward(image)
 
-        try:
-            compressed_data, entropy_stats = encode_image_optimized(results['mapped_indices'], self.num_bands)
-        except Exception as e:
-            print(f"Warning: Entropy coding failed ({e}), returning empty data")
-            # Fallback: return empty bytes if entropy coding fails
-            compressed_data = b''
+        # Create CCSDS-123.0-B-2 compliant header
+        header = CCSDS123Header()
 
-        return compressed_data
+        # Set image parameters
+        if len(image.shape) == 4:
+            _, num_bands, height, width = image.shape
+        else:
+            num_bands, height, width = image.shape
+
+        header.set_image_params(
+            height=height,
+            width=width,
+            num_bands=num_bands,
+            bit_depth=self.dynamic_range,
+            signed=False
+        )
+
+        # Set predictor parameters
+        predictor_mode = PredictorMode.FULL
+        header.set_predictor_params(
+            mode=predictor_mode,
+            v_min=4,
+            v_max=6,
+            rescale_interval=64
+        )
+
+        # Set entropy coder parameters
+        header.set_entropy_coder_params(gamma_star=1, k=1)
+
+        # Add supplementary tables if any are defined
+        if hasattr(self, '_supplementary_tables'):
+            for table_info in self._supplementary_tables:
+                header.add_supplementary_table(
+                    table_info['table_id'],
+                    table_info['table_type'],
+                    table_info['dimension'],
+                    table_info['data']
+                )
+
+        # Determine optimal encoding order for this image
+        encoding_order = self._determine_optimal_encoding_order(image)
+
+        # Set encoding order in header
+        if encoding_order == 'BI':
+            header.image_metadata.sample_encoding_order = EncodingOrder.BAND_INTERLEAVED
+        else:
+            header.image_metadata.sample_encoding_order = EncodingOrder.BAND_SEQUENTIAL
+
+        # Pack header
+        header_bytes = header.pack()
+
+        # Create bitstream formatter
+        formatter = BitstreamFormatter(8)  # 8-bit output words
+
+        # Use configurable entropy coding system
+        entropy_coder = entropy_coder_type or self.compression_params.get('entropy_coder_type', 'optimized_hybrid')
+
+        try:
+            mapped_indices = results['mapped_indices']
+            compressed_body = None
+            entropy_stats = {}
+
+            if entropy_coder == 'streaming':
+                # Use streaming entropy coder for large images
+                chunk_size = self.compression_params.get('streaming_chunk_size', (4, 32, 32))
+                compressed_body, entropy_stats = encode_image_streaming(mapped_indices, self.num_bands, chunk_size)
+
+            elif entropy_coder == 'optimized_block_adaptive':
+                # Use optimized block-adaptive entropy coding
+                block_size = self.compression_params.get('block_size', (8, 8))
+                min_block_samples = self.compression_params.get('min_block_samples', 16)
+                gpu_batch_size = self.compression_params.get('block_gpu_batch_size', 32)
+
+                compressed_body, entropy_stats = encode_image_block_adaptive_optimized(
+                    mapped_indices, self.num_bands, block_size, min_block_samples, gpu_batch_size
+                )
+
+            elif entropy_coder == 'optimized_rice':
+                # Use optimized Rice coder (Issue 2 feature)
+                rice_block_size = self.compression_params.get('rice_block_size', (16, 16))
+                rice_gpu_batch_size = self.compression_params.get('rice_gpu_batch_size', 32)
+
+                compressed_body, entropy_stats = encode_image_rice_optimized(
+                    mapped_indices, block_size=rice_block_size,
+                    device=self.device.type, gpu_batch_size=rice_gpu_batch_size
+                )
+
+            else:
+                # Use standard optimized hybrid entropy coder
+                compressed_body, entropy_stats = encode_image_optimized(mapped_indices, self.num_bands)
+
+            # Convert to bits for proper formatting
+            compressed_body_bits = formatter.bytes_to_bits(compressed_body)
+
+        except Exception as e:
+            print(f"Warning: {entropy_coder} entropy coding failed ({e}), using empty body")
+            compressed_body_bits = []
+
+        # Format complete bitstream with proper word alignment
+        compressed_bitstream = formatter.format_bitstream(
+            header_bytes=header_bytes,
+            compressed_bits=compressed_body_bits,
+            pad_to_word_boundary=True
+        )
+
+        return compressed_bitstream
+
+    def compress_with_block_adaptive(self, image: torch.Tensor,
+                                   block_size: Tuple[int, int] = (8, 8),
+                                   min_block_samples: int = 16,
+                                   gpu_batch_size: int = 32) -> bytes:
+        """
+        Compress image using block-adaptive entropy coding
+
+        Args:
+            image: Input image tensor
+            block_size: (height, width) of blocks for entropy coding
+            min_block_samples: Minimum samples per block
+            gpu_batch_size: Number of blocks to process in parallel
+
+        Returns:
+            compressed_bitstream: CCSDS-123.0-B-2 compliant compressed image
+        """
+        # Temporarily set block adaptive parameters
+        original_params = self.compression_params.copy()
+        self.compression_params.update({
+            'block_size': block_size,
+            'min_block_samples': min_block_samples,
+            'block_gpu_batch_size': gpu_batch_size
+        })
+
+        try:
+            result = self.compress(image, entropy_coder_type='optimized_block_adaptive')
+        finally:
+            # Restore original parameters
+            self.compression_params = original_params
+
+        return result
+
+    def compress_with_rice_coding(self, image: torch.Tensor,
+                                rice_block_size: Tuple[int, int] = (16, 16),
+                                gpu_batch_size: int = 32) -> bytes:
+        """
+        Compress image using Rice entropy coding (CCSDS-123.0-B-2 Issue 2)
+
+        Args:
+            image: Input image tensor
+            rice_block_size: (height, width) of Rice coding blocks
+            gpu_batch_size: Number of Rice blocks to process in parallel
+
+        Returns:
+            compressed_bitstream: CCSDS-123.0-B-2 compliant compressed image
+        """
+        # Temporarily set Rice coding parameters
+        original_params = self.compression_params.copy()
+        self.compression_params.update({
+            'rice_block_size': rice_block_size,
+            'rice_gpu_batch_size': gpu_batch_size
+        })
+
+        try:
+            result = self.compress(image, entropy_coder_type='optimized_rice')
+        finally:
+            # Restore original parameters
+            self.compression_params = original_params
+
+        return result
+
+    def compress_streaming(self, image: torch.Tensor,
+                         chunk_size: Tuple[int, int, int] = (4, 32, 32)) -> bytes:
+        """
+        Compress image using streaming entropy coding for large images
+
+        Args:
+            image: Input image tensor
+            chunk_size: (bands, height, width) of processing chunks
+
+        Returns:
+            compressed_bitstream: CCSDS-123.0-B-2 compliant compressed image
+        """
+        # Temporarily set streaming parameters
+        original_params = self.compression_params.copy()
+        self.compression_params.update({
+            'streaming_chunk_size': chunk_size
+        })
+
+        try:
+            result = self.compress(image, entropy_coder_type='streaming')
+        finally:
+            # Restore original parameters
+            self.compression_params = original_params
+
+        return result
+
+    def _determine_optimal_encoding_order(self, image: torch.Tensor) -> str:
+        """
+        Determine optimal encoding order for optimized processing
+
+        Args:
+            image: Input image tensor
+
+        Returns:
+            encoding_order: 'BI' or 'BSQ'
+        """
+        # For optimized vectorized processing, BSQ is typically more efficient
+        # as it allows processing entire bands at once
+        # However, for images with high spectral correlation, BI might be better
+
+        analysis = EncodingOrderOptimizer.analyze_image_structure(image)
+
+        # Override recommendation based on optimization considerations
+        if analysis['spectral_correlation'] > 0.8:
+            # Very high spectral correlation - BI might be worth the processing overhead
+            return 'BI'
+        else:
+            # Default to BSQ for vectorized efficiency
+            return 'BSQ'
+
+    def optimize_encoding_order(self, image: torch.Tensor) -> str:
+        """
+        Analyze image and recommend optimal encoding order
+
+        Args:
+            image: Input image tensor [Z, Y, X] or [1, Z, Y, X]
+
+        Returns:
+            encoding_order: Recommended encoding order ('BI' or 'BSQ')
+        """
+        return self._determine_optimal_encoding_order(image)
+
+    def compare_encoding_orders(self, image: torch.Tensor) -> dict:
+        """
+        Compare compression performance of different encoding orders
+
+        Args:
+            image: Input image tensor [Z, Y, X] or [1, Z, Y, X]
+
+        Returns:
+            comparison: Dictionary with performance comparison
+        """
+        try:
+            from ccsds.encoding_orders import EncodingOrder as EO
+        except ImportError:
+            from ..ccsds.encoding_orders import EncodingOrder as EO
+        comparison = EncodingOrderOptimizer.estimate_compression_benefit(
+            image,
+            EO.BAND_INTERLEAVED,
+            EO.BAND_SEQUENTIAL
+        )
+
+        return {
+            'bi_prediction_variance': comparison['order1_prediction_variance'],
+            'bsq_prediction_variance': comparison['order2_prediction_variance'],
+            'recommended': 'BI' if comparison['recommended'] == EO.BAND_INTERLEAVED else 'BSQ',
+            'benefit_ratio': comparison['benefit_ratio'],
+            'analysis': EncodingOrderOptimizer.analyze_image_structure(image),
+            'optimized_recommendation': self._determine_optimal_encoding_order(image)
+        }
+
+    def enable_periodic_error_updating(self, enable: bool = True,
+                                     update_interval: int = 1000,
+                                     adaptation_rate: float = 0.1) -> None:
+        """
+        Enable or disable periodic error limit updating
+
+        Args:
+            enable: Whether to enable periodic updating
+            update_interval: Number of samples between updates
+            adaptation_rate: Rate of adaptation (0.0-1.0)
+        """
+        self.periodic_error_updating = enable
+        self.error_update_interval = update_interval
+        self.error_adaptation_rate = adaptation_rate
+
+    def _update_error_limits_vectorized(self, residuals: torch.Tensor,
+                                      mapped_indices: torch.Tensor,
+                                      band: int) -> None:
+        """
+        Vectorized periodic error limit updating for optimized processing
+
+        Args:
+            residuals: Tensor of prediction residuals for current processing batch
+            mapped_indices: Tensor of quantization indices
+            band: Current band index
+        """
+        if self.lossless or not self.periodic_error_updating:
+            return
+
+        # Update statistics buffer
+        self._compression_stats_buffer['prediction_errors'].extend(residuals.flatten().tolist())
+        self._compression_stats_buffer['quantization_indices'].extend(mapped_indices.flatten().tolist())
+        self._compression_stats_buffer['sample_count'] += residuals.numel()
+
+        # Check if we should update error limits
+        if (self._compression_stats_buffer['sample_count'] % self.error_update_interval == 0 and
+            self._compression_stats_buffer['sample_count'] > 0):
+
+            # Compute current compression statistics
+            recent_errors = torch.tensor(self._compression_stats_buffer['prediction_errors'][-1000:])
+            recent_indices = torch.tensor(self._compression_stats_buffer['quantization_indices'][-1000:])
+
+            # Compute error statistics
+            error_variance = torch.var(recent_errors) if len(recent_errors) > 1 else 0.0
+            avg_index_magnitude = torch.mean(torch.abs(recent_indices)) if len(recent_indices) > 0 else 0.0
+
+            # Determine adjustment factor
+            adjustment_factor = self._compute_error_adjustment_vectorized(
+                error_variance.item(), avg_index_magnitude.item(), band
+            )
+
+            # Apply adjustment to quantizer error limits
+            if hasattr(self.quantizer, 'absolute_error_limits') and adjustment_factor != 0:
+                current_limits = self.quantizer.absolute_error_limits.clone()
+                band_weight = self._compute_band_weight_optimized(band)
+
+                # Vectorized update
+                new_limits = current_limits * (1.0 + self.error_adaptation_rate * adjustment_factor * band_weight)
+                new_limits = torch.clamp(new_limits, 0, 31)
+
+                self.quantizer.set_error_limits(absolute_limits=new_limits)
+
+        # Keep buffer size manageable
+        max_buffer_size = 5000
+        for key in ['prediction_errors', 'quantization_indices']:
+            if len(self._compression_stats_buffer[key]) > max_buffer_size:
+                self._compression_stats_buffer[key] = self._compression_stats_buffer[key][-max_buffer_size//2:]
+
+    def _compute_error_adjustment_vectorized(self, error_variance: float,
+                                           avg_index_magnitude: float,
+                                           band: int) -> float:
+        """
+        Compute error limit adjustment factor using vectorized statistics
+
+        Args:
+            error_variance: Variance of recent prediction errors
+            avg_index_magnitude: Average magnitude of quantization indices
+            band: Current band index
+
+        Returns:
+            adjustment_factor: Factor to adjust error limits (-0.5 to 0.5)
+        """
+        adjustment = 0.0
+
+        # High error variance suggests need for tighter error limits
+        if error_variance > 25.0:  # High variance
+            adjustment -= 0.2
+        elif error_variance < 4.0:  # Low variance
+            adjustment += 0.1
+
+        # High quantization indices suggest high compression - may need looser limits
+        if avg_index_magnitude > 10.0:
+            adjustment += 0.15
+        elif avg_index_magnitude < 2.0:
+            adjustment -= 0.1
+
+        # Band-specific adjustment (later bands get higher quality)
+        band_progress = band / max(1, self.num_bands - 1)
+        if band_progress > 0.7:  # Later bands
+            adjustment -= 0.05
+
+        return max(-0.5, min(0.5, adjustment))
+
+    def _compute_band_weight_optimized(self, band_index: int) -> float:
+        """
+        Compute band-specific weight for optimized processing
+
+        Args:
+            band_index: Spectral band index
+
+        Returns:
+            weight: Weight factor (0.2 to 1.0)
+        """
+        if self.num_bands == 1:
+            return 1.0
+
+        # For optimized processing, use simpler weight calculation
+        normalized_band = band_index / (self.num_bands - 1)
+
+        # Higher weight for mid-spectrum bands
+        if 0.2 <= normalized_band <= 0.6:
+            return 1.0
+        elif normalized_band < 0.2 or normalized_band > 0.8:
+            return 0.5
+        else:
+            return 0.7
+
+    def add_supplementary_table(self, table_id: int, table_type: TableType,
+                               dimension: TableDimension, data: Union[List, torch.Tensor]) -> None:
+        """
+        Add supplementary information table to optimized compressor header
+
+        Args:
+            table_id: Unique table identifier
+            table_type: Data type (unsigned int, signed int, float)
+            dimension: Table dimensions (1D-Z, 2D-ZX, 2D-YX)
+            data: Table data (will be converted to appropriate device)
+        """
+        # Convert data to appropriate device if it's a tensor
+        if isinstance(data, torch.Tensor):
+            data = data.to(self.device)
+
+        # This will be used when creating the header in compress() method
+        if not hasattr(self, '_supplementary_tables'):
+            self._supplementary_tables = []
+
+        self._supplementary_tables.append({
+            'table_id': table_id,
+            'table_type': table_type,
+            'dimension': dimension,
+            'data': data
+        })
+
+    def add_wavelength_table(self, wavelengths: Union[List[float], torch.Tensor], table_id: int = 1) -> None:
+        """
+        Add wavelength information table for optimized compressor
+
+        Args:
+            wavelengths: List or tensor of wavelength values for each band
+            table_id: Unique table identifier
+        """
+        self.add_supplementary_table(table_id, TableType.FLOATING_POINT,
+                                    TableDimension.ONE_DIMENSIONAL_Z, wavelengths)
+
+    def add_bad_pixel_table(self, bad_pixels: Union[List[Tuple[int, int]], torch.Tensor],
+                           table_id: int = 2) -> None:
+        """
+        Add bad/dead pixel location table for optimized compressor
+
+        Args:
+            bad_pixels: List of (y, x) coordinates or tensor of bad pixel locations
+            table_id: Unique table identifier
+        """
+        if isinstance(bad_pixels, list):
+            # Convert list of (y,x) tuples to flat list [y1, x1, y2, x2, ...]
+            flat_coords = []
+            for y, x in bad_pixels:
+                flat_coords.extend([y, x])
+            bad_pixels = flat_coords
+
+        self.add_supplementary_table(table_id, TableType.UNSIGNED_INTEGER,
+                                    TableDimension.TWO_DIMENSIONAL_YX, bad_pixels)
+
+    def add_calibration_table(self, calibration_data: Union[List[float], torch.Tensor],
+                             dimension: TableDimension = TableDimension.ONE_DIMENSIONAL_Z,
+                             table_id: int = 3) -> None:
+        """
+        Add calibration data table for optimized compressor
+
+        Args:
+            calibration_data: Calibration coefficients or factors
+            dimension: Table dimension type
+            table_id: Unique table identifier
+        """
+        self.add_supplementary_table(table_id, TableType.FLOATING_POINT,
+                                    dimension, calibration_data)
+
+    def clear_supplementary_tables(self) -> None:
+        """Clear all supplementary tables from optimized compressor"""
+        if hasattr(self, '_supplementary_tables'):
+            self._supplementary_tables.clear()
+
+    def get_supplementary_tables_info(self) -> List[Dict[str, Any]]:
+        """Get information about supplementary tables in optimized compressor"""
+        if not hasattr(self, '_supplementary_tables'):
+            return []
+
+        info = []
+        for table in self._supplementary_tables:
+            data = table['data']
+            if isinstance(data, torch.Tensor):
+                data_size = data.numel()
+            elif isinstance(data, list):
+                data_size = len(data)
+            else:
+                data_size = 1
+
+            info.append({
+                'id': table['table_id'],
+                'type': table['table_type'].name,
+                'dimension': table['dimension'].name,
+                'data_size': data_size
+            })
+        return info
+
+    def enable_narrow_local_sums(self, enable: bool = True, local_sum_type: str = 'neighbor_oriented') -> None:
+        """
+        Enable narrow local sums for hardware pipelining optimization in the predictor
+
+        Args:
+            enable: Whether to use narrow local sums
+            local_sum_type: 'neighbor_oriented' or 'column_oriented'
+        """
+        self.predictor.enable_narrow_local_sums(enable, local_sum_type)
+
+    def get_issue2_features_info(self) -> Dict[str, Any]:
+        """Get information about enabled Issue 2 features"""
+        predictor_info = self.predictor.get_prediction_mode_info()
+
+        return {
+            'narrow_local_sums_enabled': predictor_info.get('use_narrow_local_sums', False),
+            'local_sum_type': predictor_info.get('local_sum_type', 'neighbor_oriented'),
+            'rice_coder_available': True,
+            'supplementary_tables_count': len(getattr(self, '_supplementary_tables', [])),
+            'supplementary_tables': self.get_supplementary_tables_info(),
+            'reverse_order_decoding_ready': True,  # Always available for optimized version
+            'vectorized_processing': predictor_info.get('vectorized', False)
+        }
 
     def benchmark(self, image_sizes: list, num_runs: int = 3) -> Dict:
         """
@@ -784,6 +1399,228 @@ def create_optimized_near_lossless_compressor(
         absolute_error_limits=absolute_error_limits,
         relative_error_limits=relative_error_limits,
         gpu_batch_size=gpu_batch_size
+    )
+
+    return compressor
+
+
+def create_optimized_block_adaptive_lossless_compressor(
+    num_bands: int,
+    block_size: Tuple[int, int] = (8, 8),
+    optimization_mode: str = 'full',
+    device: str = 'auto',
+    use_mixed_precision: bool = False,
+    gpu_batch_size: int = 8,
+    block_gpu_batch_size: int = 32,
+    **kwargs
+) -> OptimizedCCSDS123Compressor:
+    """
+    Create an optimized lossless CCSDS-123.0-B-2 compressor with block-adaptive entropy coding
+
+    Args:
+        num_bands: Number of spectral bands
+        block_size: (height, width) of blocks for entropy coding
+        optimization_mode: 'full', 'causal', or 'streaming'
+        device: 'auto', 'cpu', 'cuda', or specific device (e.g., 'cuda:0')
+        use_mixed_precision: Enable mixed precision for GPU speedup
+        gpu_batch_size: Number of bands to process in parallel on GPU
+        block_gpu_batch_size: Number of blocks to process in parallel for entropy coding
+        **kwargs: Additional compressor parameters
+
+    Returns:
+        Configured optimized lossless compressor with block-adaptive entropy coding
+    """
+    # Auto-detect device
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    compressor = OptimizedCCSDS123Compressor(
+        num_bands=num_bands,
+        lossless=True,
+        optimization_mode=optimization_mode,
+        device=device,
+        use_mixed_precision=use_mixed_precision,
+        **kwargs
+    )
+
+    # Set block-adaptive parameters
+    compressor.set_compression_parameters(
+        entropy_coder_type='optimized_block_adaptive',
+        block_size=block_size,
+        min_block_samples=kwargs.get('min_block_samples', 16),
+        gpu_batch_size=gpu_batch_size,
+        block_gpu_batch_size=block_gpu_batch_size
+    )
+
+    return compressor
+
+
+def create_optimized_block_adaptive_near_lossless_compressor(
+    num_bands: int,
+    absolute_error_limits: Optional[torch.Tensor] = None,
+    relative_error_limits: Optional[torch.Tensor] = None,
+    block_size: Tuple[int, int] = (8, 8),
+    optimization_mode: str = 'full',
+    device: str = 'auto',
+    use_mixed_precision: bool = False,
+    gpu_batch_size: int = 8,
+    block_gpu_batch_size: int = 32,
+    **kwargs
+) -> OptimizedCCSDS123Compressor:
+    """
+    Create an optimized near-lossless CCSDS-123.0-B-2 compressor with block-adaptive entropy coding
+
+    Args:
+        num_bands: Number of spectral bands
+        absolute_error_limits: [num_bands] absolute error limits per band
+        relative_error_limits: [num_bands] relative error limits per band
+        block_size: (height, width) of blocks for entropy coding
+        optimization_mode: 'full', 'causal', or 'streaming'
+        device: 'auto', 'cpu', 'cuda', or specific device (e.g., 'cuda:0')
+        use_mixed_precision: Enable mixed precision for GPU speedup
+        gpu_batch_size: Number of bands to process in parallel on GPU
+        block_gpu_batch_size: Number of blocks to process in parallel for entropy coding
+        **kwargs: Additional compressor parameters
+
+    Returns:
+        Configured optimized near-lossless compressor with block-adaptive entropy coding
+    """
+    # Auto-detect device
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    compressor = OptimizedCCSDS123Compressor(
+        num_bands=num_bands,
+        lossless=False,
+        optimization_mode=optimization_mode,
+        device=device,
+        use_mixed_precision=use_mixed_precision,
+        **kwargs
+    )
+
+    # Set error limits
+    if absolute_error_limits is None and relative_error_limits is None:
+        absolute_error_limits = torch.ones(num_bands) * 2
+
+    # Set block-adaptive parameters
+    compressor.set_compression_parameters(
+        entropy_coder_type='optimized_block_adaptive',
+        absolute_error_limits=absolute_error_limits,
+        relative_error_limits=relative_error_limits,
+        block_size=block_size,
+        min_block_samples=kwargs.get('min_block_samples', 16),
+        gpu_batch_size=gpu_batch_size,
+        block_gpu_batch_size=block_gpu_batch_size
+    )
+
+    return compressor
+
+
+def create_optimized_rice_lossless_compressor(
+    num_bands: int,
+    rice_block_size: Tuple[int, int] = (16, 16),
+    optimization_mode: str = 'full',
+    device: str = 'auto',
+    use_mixed_precision: bool = False,
+    gpu_batch_size: int = 8,
+    rice_gpu_batch_size: int = 32,
+    **kwargs
+) -> OptimizedCCSDS123Compressor:
+    """
+    Create an optimized lossless CCSDS-123.0-B-2 compressor with Rice entropy coding (Issue 2)
+
+    Args:
+        num_bands: Number of spectral bands
+        rice_block_size: (height, width) of Rice coding blocks
+        optimization_mode: 'full', 'causal', or 'streaming'
+        device: 'auto', 'cpu', 'cuda', or specific device (e.g., 'cuda:0')
+        use_mixed_precision: Enable mixed precision for GPU speedup
+        gpu_batch_size: Number of bands to process in parallel on GPU
+        rice_gpu_batch_size: Number of Rice blocks to process in parallel
+        **kwargs: Additional compressor parameters
+
+    Returns:
+        Configured optimized lossless compressor with Rice entropy coding
+    """
+    # Auto-detect device
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    compressor = OptimizedCCSDS123Compressor(
+        num_bands=num_bands,
+        lossless=True,
+        optimization_mode=optimization_mode,
+        device=device,
+        use_mixed_precision=use_mixed_precision,
+        **kwargs
+    )
+
+    # Set Rice coding parameters
+    compressor.set_compression_parameters(
+        entropy_coder_type='optimized_rice',
+        rice_block_size=rice_block_size,
+        gpu_batch_size=gpu_batch_size,
+        rice_gpu_batch_size=rice_gpu_batch_size
+    )
+
+    return compressor
+
+
+def create_optimized_rice_near_lossless_compressor(
+    num_bands: int,
+    absolute_error_limits: Optional[torch.Tensor] = None,
+    relative_error_limits: Optional[torch.Tensor] = None,
+    rice_block_size: Tuple[int, int] = (16, 16),
+    optimization_mode: str = 'full',
+    device: str = 'auto',
+    use_mixed_precision: bool = False,
+    gpu_batch_size: int = 8,
+    rice_gpu_batch_size: int = 32,
+    **kwargs
+) -> OptimizedCCSDS123Compressor:
+    """
+    Create an optimized near-lossless CCSDS-123.0-B-2 compressor with Rice entropy coding (Issue 2)
+
+    Args:
+        num_bands: Number of spectral bands
+        absolute_error_limits: [num_bands] absolute error limits per band
+        relative_error_limits: [num_bands] relative error limits per band
+        rice_block_size: (height, width) of Rice coding blocks
+        optimization_mode: 'full', 'causal', or 'streaming'
+        device: 'auto', 'cpu', 'cuda', or specific device (e.g., 'cuda:0')
+        use_mixed_precision: Enable mixed precision for GPU speedup
+        gpu_batch_size: Number of bands to process in parallel on GPU
+        rice_gpu_batch_size: Number of Rice blocks to process in parallel
+        **kwargs: Additional compressor parameters
+
+    Returns:
+        Configured optimized near-lossless compressor with Rice entropy coding
+    """
+    # Auto-detect device
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    compressor = OptimizedCCSDS123Compressor(
+        num_bands=num_bands,
+        lossless=False,
+        optimization_mode=optimization_mode,
+        device=device,
+        use_mixed_precision=use_mixed_precision,
+        **kwargs
+    )
+
+    # Set error limits
+    if absolute_error_limits is None and relative_error_limits is None:
+        absolute_error_limits = torch.ones(num_bands) * 2
+
+    # Set Rice coding parameters
+    compressor.set_compression_parameters(
+        entropy_coder_type='optimized_rice',
+        absolute_error_limits=absolute_error_limits,
+        relative_error_limits=relative_error_limits,
+        rice_block_size=rice_block_size,
+        gpu_batch_size=gpu_batch_size,
+        rice_gpu_batch_size=rice_gpu_batch_size
     )
 
     return compressor

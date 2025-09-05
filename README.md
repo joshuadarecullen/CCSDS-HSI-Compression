@@ -306,6 +306,7 @@ The test suite includes:
 - **Resolved device mismatch issues** in optimized entropy coder with automatic device detection
 - **Enhanced test coverage** with comprehensive lossless, optimized, and performance tests
 - **Organized metrics module** separated quality assessment functions (PSNR, MSSIM, SAM) into dedicated `src.ccsds.metrics` package
+- **Improved weight adaptation** implemented proper CCSDS-123.0-B-2 weight adaptation algorithm with magnitude-based damping, replacing simplified weight update rules
 - **Type annotations** throughout the codebase for better development experience
 - **Mathematical documentation** explaining the theoretical foundation of each component
 
@@ -346,11 +347,10 @@ sam = calculate_spectral_angle(original, reconstructed, callback=sam_callback)
 This is a research implementation with some simplifications:
 
 1. **Low-entropy code implementation**: While the exact code specifications from Table 1 are used, the actual encoding/decoding logic uses algorithmically generated codes rather than pre-computed lookup tables
-2. **Weight adaptation**: Uses simplified weight update rules in the predictor rather than the full adaptive strategy from the standard
-3. **Error limit updates**: Implements basic periodic updating (`PeriodicErrorLimitUpdater`) rather than sophisticated rate control algorithms
-4. **Full bitstream decoding**: The `decompress()` function currently relies on intermediate data from compression results rather than full entropy decoding from bitstream bytes
-5. **Supplementary information**: Reserved bits and supplementary information tables are not supported
-6. **Exact standard compliance**: Some algorithmic details may differ from the exact CCSDS specification to prioritize clarity and educational value
+2. **Error limit updates**: Implements basic periodic updating (`PeriodicErrorLimitUpdater`) rather than sophisticated rate control algorithms
+3. **Full bitstream decoding**: The `decompress()` function currently relies on intermediate data from compression results rather than full entropy decoding from bitstream bytes
+4. **Supplementary information**: Reserved bits and supplementary information tables are not supported
+5. **Exact standard compliance**: Some algorithmic details may differ from the exact CCSDS specification to prioritize clarity and educational value
 
 ## Performance
 

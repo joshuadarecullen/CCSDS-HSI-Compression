@@ -10,6 +10,8 @@ from .ccsds_compressor import (
     CCSDS123Compressor,
     create_lossless_compressor,
     create_near_lossless_compressor,
+    create_block_adaptive_lossless_compressor,
+    create_block_adaptive_near_lossless_compressor,
     decompress
 )
 
@@ -21,7 +23,7 @@ from .metrics import (
 
 from .predictor import SpectralPredictor, NarrowLocalSumPredictor
 from .quantizer import UniformQuantizer, LosslessQuantizer, PeriodicErrorLimitUpdater
-from .entropy_coder import HybridEntropyCoder, encode_image, BitWriter
+from .entropy_coder import HybridEntropyCoder, encode_image, BitWriter, BlockAdaptiveEntropyCoder
 from .sample_representative import SampleRepresentativeCalculator, OptimizedSampleRepresentative
 
 __all__ = [
@@ -29,6 +31,8 @@ __all__ = [
     'CCSDS123Compressor',
     'create_lossless_compressor',
     'create_near_lossless_compressor',
+    'create_block_adaptive_lossless_compressor',
+    'create_block_adaptive_near_lossless_compressor',
     'decompress',
     
     # Quality assessment functions
@@ -43,6 +47,7 @@ __all__ = [
     'LosslessQuantizer',
     'PeriodicErrorLimitUpdater',
     'HybridEntropyCoder',
+    'BlockAdaptiveEntropyCoder',
     'encode_image',
     'BitWriter',
     'SampleRepresentativeCalculator',

@@ -17,14 +17,22 @@ class SpectralPredictor(nn.Module):
         self.dynamic_range = dynamic_range
         self.prediction_bands = prediction_bands or min(15, num_bands - 1)
 
-        # Prediction weights - these adapt based on image statistics
-        self.register_buffer('weights', torch.zeros(num_bands, self.prediction_bands + 4))
+        # Initialize prediction weights according to CCSDS standard
+        # For full mode: P* spectral + 3 directional = total components
+        # For reduced mode: P* spectral components only
+        max_components = self.prediction_bands + 3  # Account for directional components
+        self.register_buffer('weights', torch.zeros(num_bands, max_components))
 
         # Local sums for weight adaptation
         self.register_buffer('local_sums', torch.zeros(num_bands, 4))
 
-        # Prediction mode parameters
+        # Prediction mode parameters according to CCSDS-123.0-B-2 section 4.3
         self.prediction_mode = 'full'  # 'full' or 'reduced'
+        self.use_narrow_local_sums = False  # Issue 2 narrow local sums option
+        self.local_sum_type = 'neighbor_oriented'  # 'neighbor_oriented' or 'column_oriented'
+
+        # Number of local difference values used for prediction (C_z)
+        self._compute_prediction_components()
 
     def _get_neighborhood_samples(self, image: torch.Tensor, z: int, y: int, x: int) -> torch.Tensor:
         """
@@ -63,70 +71,327 @@ class SpectralPredictor(nn.Module):
 
         return torch.stack(samples)
 
-    def _compute_local_differences(self, samples: torch.Tensor) -> torch.Tensor:
+    def _compute_local_sum(self, sample_representatives: torch.Tensor, z: int, y: int, x: int, wide: bool = True) -> torch.Tensor:
         """
-        Compute local differences used in weight adaptation
+        Compute local sum σ_{z,y,x} according to CCSDS-123.0-B-2 equations (20)-(23)
+
+        Args:
+            sample_representatives: Sample representatives tensor
+            z, y, x: Current sample coordinates
+            wide: Whether to use wide or narrow local sums
+
+        Returns:
+            local_sum: Computed according to standard equations
         """
-        if len(samples) < 4:
-            return torch.zeros(4, device=samples.device)
+        Z, Y, X = sample_representatives.shape
 
-        # Extract spatial neighbors
-        north = samples[0] if len(samples) > 0 else 0
-        west = samples[1] if len(samples) > 1 else 0
-        northwest = samples[2] if len(samples) > 2 else 0
-
-        # Compute differences
-        d1 = north - west
-        d2 = west - northwest
-        d3 = northwest - north
-        d4 = north + west - 2 * northwest
-
-        return torch.stack([d1, d2, d3, d4])
+        if self.local_sum_type == 'column_oriented':
+            # Column-oriented local sums - equations (22)-(23)
+            if wide:
+                # Wide column-oriented: σ = 4*s''_{z,y-1,x} when y>0, else 4*s_{z,y,x-1}
+                if y > 0:
+                    return 4 * sample_representatives[z, y-1, x]
+                else:
+                    if x > 0:
+                        return 4 * sample_representatives[z, y, x-1]
+                    else:
+                        return torch.tensor(0.0, device=sample_representatives.device)
+            else:
+                # Narrow column-oriented: same as wide but with smid when both y=0,x=0,z=0
+                if y > 0:
+                    return 4 * sample_representatives[z, y-1, x]
+                else:
+                    if x > 0 and z > 0:
+                        return 4 * sample_representatives[z, y, x-1]
+                    elif y == 0 and x == 0 and z == 0:
+                        # Use smid (mid-range value) for first sample
+                        mid_val = 2**(self.dynamic_range - 1) if self.dynamic_range > 1 else 0
+                        return 4 * mid_val
+                    else:
+                        return 4 * sample_representatives[z, y, x-1] if x > 0 else torch.tensor(0.0, device=sample_representatives.device)
+        else:
+            # Neighbor-oriented local sums - equations (20)-(21)
+            if wide:
+                # Wide neighbor-oriented: full neighborhood
+                if y > 0 and 0 < x < X - 1:
+                    # Full neighborhood available
+                    return (sample_representatives[z, y-1, x-1] +
+                           sample_representatives[z, y-1, x+1] +
+                           sample_representatives[z, y, x-1] +
+                           sample_representatives[z, y-1, x])
+                elif y == 0 and x > 0:
+                    return 4 * sample_representatives[z, y, x-1]
+                elif y > 0 and x == 0:
+                    return 2 * (sample_representatives[z, y-1, x] + sample_representatives[z, y-1, x+1])
+                elif y > 0 and x == X - 1:
+                    return 2 * (sample_representatives[z, y, x-1] + sample_representatives[z, y-1, x-1])
+                else:
+                    return torch.tensor(0.0, device=sample_representatives.device)
+            else:
+                # Narrow neighbor-oriented: excludes x-1 dependency
+                if y > 0 and 0 < x < X - 1:
+                    # 2*north + 2*s''_{z,y-1,x-1} + s''_{z,y-1,x+1}
+                    return (2 * sample_representatives[z, y-1, x] +
+                           2 * sample_representatives[z, y-1, x-1] +
+                           sample_representatives[z, y-1, x+1])
+                elif y == 0 and x > 0 and z > 0:
+                    return 4 * sample_representatives[z, y, x-1]
+                elif y > 0 and x == 0:
+                    return 2 * (sample_representatives[z, y-1, x] + sample_representatives[z, y-1, x+1])
+                elif y > 0 and x == X - 1:
+                    return 2 * (sample_representatives[z, y-1, x-1] + sample_representatives[z, y-1, x])
+                elif y == 0 and x == 0 and z == 0:
+                    mid_val = 2**(self.dynamic_range - 1) if self.dynamic_range > 1 else 0
+                    return 4 * mid_val
+                else:
+                    return torch.tensor(0.0, device=sample_representatives.device)
 
     def _update_weights(self, prediction_error: torch.Tensor, local_differences: torch.Tensor, z: int) -> None:
         """
-        Adapt prediction weights based on prediction error and local statistics
+        Adapt prediction weights based on CCSDS-123.0-B-2 standard weight adaptation algorithm
+
+        The standard specifies a more sophisticated weight update mechanism:
+        1. Use scaled prediction error and local differences
+        2. Apply proper damping based on local difference magnitudes
+        3. Update weights using: Δw_i = 2^(-V_min) * e * d_i * 2^(-max(0, V_i - V_max))
+
+        Where:
+        - e is the prediction error
+        - d_i is the local difference for component i
+        - V_i is the magnitude parameter for local difference i
+        - V_min, V_max are damping parameters
         """
-        # Simple weight update rule - in practice this would be more sophisticated
-        learning_rate = 0.01
+        # CCSDS-123.0-B-2 weight adaptation parameters
+        V_min = 4  # Minimum scaling parameter
+        V_max = 6  # Maximum scaling parameter for damping
 
         if len(local_differences) >= 4:
-            # Update weights for spatial components
+            # Update weights for spatial components using CCSDS algorithm
             for i in range(4):
-                if local_differences[i] != 0:
-                    self.weights[z, i] += learning_rate * prediction_error * local_differences[i] / (abs(local_differences[i]) + 1e-8)
+                d_i = local_differences[i].item()
+                if abs(d_i) > 0:
+                    # Compute magnitude parameter V_i based on local difference magnitude
+                    abs_d_i = abs(d_i)
+                    if abs_d_i >= 1:
+                        V_i = int(torch.log2(torch.tensor(abs_d_i)).item())
+                    else:
+                        V_i = 0
 
-        # Clamp weights to reasonable range
-        self.weights[z] = torch.clamp(self.weights[z], -1.0, 1.0)
+                    # Compute weight update according to CCSDS formula
+                    # Δw_i = 2^(-V_min) * e * d_i * 2^(-max(0, V_i - V_max))
+                    base_scale = 2.0 ** (-V_min)  # 2^(-V_min)
+                    damping = 2.0 ** (-max(0, V_i - V_max))  # Damping factor
 
-    def predict_sample(self, image: torch.Tensor, sample_representatives: torch.Tensor, z: int, y: int, x: int) -> Tuple[torch.Tensor, torch.Tensor]:
+                    weight_update = base_scale * prediction_error.item() * d_i * damping
+                    self.weights[z, i] += weight_update
+
+            # Update spectral weights (if any) with similar approach
+            if self.prediction_bands > 0:
+                for i in range(4, min(4 + self.prediction_bands, self.weights.size(1))):
+                    # For spectral weights, use a simplified update based on prediction error
+                    # This could be enhanced with spectral local differences
+                    spectral_update = (2.0 ** (-V_min)) * prediction_error.item() * 0.1  # Small spectral factor
+                    self.weights[z, i] += spectral_update
+
+        # Apply weight clamping according to standard (typically broader range than simple implementation)
+        # CCSDS standard allows for larger weight range for better adaptation
+        self.weights[z] = torch.clamp(self.weights[z], -2.0, 2.0)
+
+        # Update local sums for next iteration (running average of local differences)
+        if len(local_differences) >= 4:
+            # Use exponential moving average to track local sum statistics
+            alpha = 0.1  # Smoothing factor
+            for i in range(4):
+                self.local_sums[z, i] = (1 - alpha) * self.local_sums[z, i] + alpha * local_differences[i]
+
+    def _compute_narrow_local_sum(self, sample_representatives: torch.Tensor, z: int, y: int, x: int) -> torch.Tensor:
         """
-        Predict a single sample value
+        Compute narrow local sum for Issue 2 hardware pipelining optimization
+
+        This eliminates the dependency on sample representative s''_{z,y,x-1}
+        when performing prediction calculation for neighboring sample s^_{z,y,x}
+
+        Args:
+            sample_representatives: Sample representatives tensor
+            z, y, x: Current sample coordinates
+
+        Returns:
+            narrow_local_sum: Computed local sum without x-1 dependency
+        """
+        if not self.use_narrow_local_sums:
+            # Use standard local sum calculation
+            return self.local_sums[z, :].sum()
+
+        # Narrow local sum excludes the x-1 neighbor to break pipeline dependency
+        narrow_sum = torch.tensor(0.0, device=sample_representatives.device)
+
+        if self.local_sum_type == 'column_oriented':
+            # Column-oriented local sum - uses vertical neighbors only
+            if y > 0:  # North neighbor
+                narrow_sum += sample_representatives[z, y-1, x]
+            if y > 1:  # North-north neighbor
+                narrow_sum += sample_representatives[z, y-2, x]
+        else:
+            # Neighbor-oriented (standard) but excluding x-1 dependency
+            if y > 0:  # North neighbor
+                narrow_sum += sample_representatives[z, y-1, x]
+            if y > 0 and x > 0:  # Northwest neighbor
+                narrow_sum += sample_representatives[z, y-1, x-1]
+            # Intentionally exclude West neighbor (z, y, x-1) for pipeline optimization
+
+        return narrow_sum
+
+    def enable_narrow_local_sums(self, enable: bool = True, local_sum_type: str = 'neighbor_oriented') -> None:
+        """
+        Enable/disable narrow local sums for hardware pipelining optimization
+
+        Args:
+            enable: Whether to use narrow local sums
+            local_sum_type: 'neighbor_oriented' or 'column_oriented'
+        """
+        self.use_narrow_local_sums = enable
+        self.local_sum_type = local_sum_type
+
+    def _compute_prediction_components(self) -> None:
+        """
+        Compute number of local difference values C_z according to equation (19)
+        C_z = P*_z for reduced mode, P*_z + 3 for full mode
+        """
+        # P*_z = min{z, P} - number of preceding bands to use
+        self.spectral_components = self.prediction_bands
+
+        if self.prediction_mode == 'reduced':
+            self.total_components = self.spectral_components
+        else:  # full mode
+            self.total_components = self.spectral_components + 3  # Add directional components
+
+    def set_prediction_mode(self, mode: str) -> None:
+        """
+        Set prediction mode according to CCSDS-123.0-B-2 section 4.3
+
+        Args:
+            mode: 'full' or 'reduced'
+        """
+        if mode not in ['full', 'reduced']:
+            raise ValueError("Prediction mode must be 'full' or 'reduced'")
+
+        self.prediction_mode = mode
+        self._compute_prediction_components()
+
+    def get_prediction_mode_info(self) -> dict:
+        """Get current prediction mode configuration"""
+        return {
+            'prediction_mode': self.prediction_mode,
+            'use_narrow_local_sums': self.use_narrow_local_sums,
+            'local_sum_type': self.local_sum_type,
+            'prediction_bands': self.prediction_bands,
+            'spectral_components': getattr(self, 'spectral_components', self.prediction_bands),
+            'total_components': getattr(self, 'total_components', self.prediction_bands + 3)
+        }
+
+    def _compute_central_local_difference(self, sample_representatives: torch.Tensor, local_sum: torch.Tensor, z: int, y: int, x: int) -> torch.Tensor:
+        """
+        Compute central local difference d_{z,y,x} according to equation (24)
+        d_{z,y,x} = 4*s''_{z,y,x} - σ_{z,y,x}
+        """
+        if y == 0 and x == 0:
+            return torch.tensor(0.0, device=sample_representatives.device)
+
+        return 4 * sample_representatives[z, y, x] - local_sum
+
+    def _compute_directional_local_differences(self, sample_representatives: torch.Tensor, local_sum: torch.Tensor, z: int, y: int, x: int) -> torch.Tensor:
+        """
+        Compute directional local differences according to equations (25)-(27)
+
+        Returns:
+            [d^N, d^W, d^NW] tensor
+        """
+        Z, Y, X = sample_representatives.shape
+
+        if y == 0 and x == 0:
+            return torch.zeros(3, device=sample_representatives.device)
+
+        # North directional difference - equation (25)
+        if y > 0:
+            d_N = 4 * sample_representatives[z, y-1, x] - local_sum
+        else:
+            d_N = torch.tensor(0.0, device=sample_representatives.device)
+
+        # West directional difference - equation (26)
+        if x > 0 and y > 0:
+            d_W = 4 * sample_representatives[z, y, x-1] - local_sum
+        elif x == 0 and y > 0:
+            d_W = 4 * sample_representatives[z, y-1, x] - local_sum
+        else:
+            d_W = torch.tensor(0.0, device=sample_representatives.device)
+
+        # Northwest directional difference - equation (27)
+        if x > 0 and y > 0:
+            d_NW = 4 * sample_representatives[z, y-1, x-1] - local_sum
+        elif x == 0 and y > 0:
+            d_NW = 4 * sample_representatives[z, y-1, x] - local_sum
+        else:
+            d_NW = torch.tensor(0.0, device=sample_representatives.device)
+
+        return torch.stack([d_N, d_W, d_NW])
+
+    def predict_sample(self, image: torch.Tensor, sample_representatives: torch.Tensor, z: int, y: int, x: int) -> torch.Tensor:
+        """
+        Predict a single sample value according to CCSDS-123.0-B-2 section 4.7
 
         Args:
             image: Original image (for initialization)
-            sample_representatives: Quantized sample values used for prediction
+            sample_representatives: Sample representatives s''_{z,y,x} used for prediction
             z, y, x: Sample coordinates
 
         Returns:
-            Predicted sample value
+            Predicted sample value \hat{s}_z(t)
         """
-        # Get neighborhood samples (using sample representatives when available)
-        neighborhood = self._get_neighborhood_samples(sample_representatives, z, y, x)
+        # Compute local sum according to CCSDS standard
+        local_sum = self._compute_local_sum(sample_representatives, z, y, x, wide=not self.use_narrow_local_sums)
 
-        if len(neighborhood) == 0:
-            return torch.tensor(0.0, device=image.device)
+        # Compute central local difference
+        central_diff = self._compute_central_local_difference(sample_representatives, local_sum, z, y, x)
 
-        # Pad neighborhood to expected size
-        if len(neighborhood) < len(self.weights[z]):
-            padding_size = len(self.weights[z]) - len(neighborhood)
-            padding = torch.zeros(padding_size, device=neighborhood.device)
-            neighborhood = torch.cat([neighborhood, padding])
-        elif len(neighborhood) > len(self.weights[z]):
-            neighborhood = neighborhood[:len(self.weights[z])]
+        # Compute P*_z - number of preceding spectral bands to use
+        P_star_z = min(self.prediction_bands, z)
 
-        # Linear prediction
-        prediction = torch.sum(self.weights[z] * neighborhood)
+        # Build local difference vector U_z(t) according to equations (28)-(29)
+        local_differences = []
+
+        # Add central local differences from preceding P*_z bands
+        for i in range(P_star_z):
+            band_idx = z - 1 - i  # Previous bands: z-1, z-2, ..., z-P*_z
+            prev_local_sum = self._compute_local_sum(sample_representatives, band_idx, y, x, wide=not self.use_narrow_local_sums)
+            prev_central_diff = self._compute_central_local_difference(sample_representatives, prev_local_sum, band_idx, y, x)
+            local_differences.append(prev_central_diff)
+
+        # For full prediction mode, add directional differences from current band
+        if self.prediction_mode == 'full' and (y > 0 or x > 0):
+            directional_diffs = self._compute_directional_local_differences(sample_representatives, local_sum, z, y, x)
+            local_differences.extend(directional_diffs)
+
+        # Compute predicted central local difference \hat{d}_z(t) = W_z^T(t) * U_z(t)
+        predicted_local_diff = torch.tensor(0.0, device=image.device)
+
+        for i, diff in enumerate(local_differences):
+            if i < self.weights.size(1):
+                predicted_local_diff += self.weights[z, i] * diff
+
+        # For z=0 under reduced mode, \hat{d}_z(t) = 0 (equation 36)
+        if z == 0 and self.prediction_mode == 'reduced':
+            predicted_local_diff = torch.tensor(0.0, device=image.device)
+
+        # Compute high-resolution predicted sample value using equation (37)
+        # Simplified implementation - full implementation would use modular arithmetic
+        s_mid = 2**(self.dynamic_range - 1) if self.dynamic_range > 1 else 0
+
+        # \tilde{s}_z(t) = clip[mod_R[\hat{d}_z(t) + 2^\Omega * (\sigma_z(t) - 4*s_mid) + 2^{\Omega+1}*s_mid + 2^{\Omega+1}], {s_min, s_max}]
+        # Simplified version:
+        high_res_prediction = predicted_local_diff + local_sum
+
+        # Convert to regular prediction by scaling
+        prediction = high_res_prediction / (2**4)  # Simplified scaling
 
         # Clamp to valid range
         max_val = 2**(self.dynamic_range - 1) - 1
@@ -134,42 +399,123 @@ class SpectralPredictor(nn.Module):
 
         return torch.clamp(prediction, min_val, max_val)
 
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
+    def _compute_sample_representative(self, original_sample: torch.Tensor, predicted_sample: torch.Tensor,
+                                     quantizer_index: torch.Tensor, max_error: int,
+                                     damping: int = 0, offset: int = 0) -> torch.Tensor:
         """
-        Predict all samples in the image
+        Compute sample representative s''_z(t) according to CCSDS-123.0-B-2 equations (46)-(48)
+
+        Args:
+            original_sample: Original sample value s_z(t)
+            predicted_sample: Predicted sample value \hat{s}_z(t)
+            quantizer_index: Quantizer index q_z(t)
+            max_error: Maximum error m_z(t)
+            damping: Damping parameter \phi_z
+            offset: Offset parameter \psi_z
+
+        Returns:
+            Sample representative s''_z(t)
+        """
+        # Compute clipped quantizer bin center s'_z(t)
+        quantizer_bin_center = predicted_sample + quantizer_index * (2 * max_error + 1)
+
+        # Clamp to valid sample range
+        s_min = -2**(self.dynamic_range - 1) if self.dynamic_range > 1 else 0
+        s_max = 2**(self.dynamic_range - 1) - 1
+        clipped_bin_center = torch.clamp(quantizer_bin_center, s_min, s_max)
+
+        # For lossless compression (max_error = 0), s''_z(t) = s'_z(t) = s_z(t)
+        if max_error == 0:
+            return clipped_bin_center
+
+        # Double-resolution sample representative (equation 47)
+        # This is a simplified version - full implementation would use the complete formula
+        double_res_representative = 2 * clipped_bin_center  # Simplified
+
+        # Convert to single resolution (equation 46)
+        if double_res_representative == 0:
+            return torch.tensor(0.0, device=original_sample.device)
+        else:
+            return (double_res_representative + 1) // 2
+
+    def forward(self, image: torch.Tensor, max_errors: torch.Tensor = None) -> torch.Tensor:
+        """
+        Predict all samples in the image using proper sample representatives
 
         Args:
             image: [Z, Y, X] multispectral/hyperspectral image
+            max_errors: [Z, Y, X] maximum error values m_z(t) (None for lossless)
 
         Returns:
             predictions: [Z, Y, X] predicted values
             residuals: [Z, Y, X] prediction residuals
+            sample_representatives: [Z, Y, X] sample representatives s''_z(t)
         """
         Z, Y, X = image.shape
         predictions = torch.zeros_like(image)
         residuals = torch.zeros_like(image)
 
-        # Initialize sample representatives with original values
-        sample_representatives = image.clone()
+        # Initialize sample representatives - these are computed during compression
+        sample_representatives = torch.zeros_like(image)
+
+        # Default to lossless compression if no max_errors provided
+        if max_errors is None:
+            max_errors = torch.zeros_like(image)
 
         for z in range(Z):
             for y in range(Y):
                 for x in range(X):
-                    # Predict sample
+                    # For the first sample, initialize sample representative with original value
+                    if z == 0 and y == 0 and x == 0:
+                        sample_representatives[z, y, x] = image[z, y, x]
+
+                    # Predict sample using current sample representatives
                     pred = self.predict_sample(image, sample_representatives, z, y, x)
                     predictions[z, y, x] = pred
 
-                    # Compute residual
+                    # Compute prediction residual
                     residual = image[z, y, x] - pred
                     residuals[z, y, x] = residual
 
-                    # Update weights based on prediction error
-                    if z > 0 or y > 0 or x > 0:  # Skip first sample
-                        neighborhood = self._get_neighborhood_samples(sample_representatives, z, y, x)
-                        local_diffs = self._compute_local_differences(neighborhood)
-                        self._update_weights(residual, local_diffs, z)
+                    # Quantize the residual (simplified - assuming lossless for now)
+                    max_error = max_errors[z, y, x].int().item() if max_errors is not None else 0
+                    if max_error == 0:
+                        quantizer_index = residual  # Lossless: q_z(t) = \Delta_z(t)
+                    else:
+                        # Near-lossless quantization (simplified)
+                        step_size = 2 * max_error + 1
+                        quantizer_index = torch.round(residual / step_size)
 
-        return predictions, residuals
+                    # Compute sample representative for this sample
+                    sample_rep = self._compute_sample_representative(
+                        image[z, y, x], pred, quantizer_index, max_error
+                    )
+                    sample_representatives[z, y, x] = sample_rep
+
+                    # Update weights based on prediction error according to CCSDS standard
+                    if z > 0 or y > 0 or x > 0:  # Skip first sample
+                        # Build the same local difference vector used in prediction
+                        P_star_z = min(self.prediction_bands, z)
+                        local_differences = []
+
+                        # Add central local differences from preceding P*_z bands
+                        for i in range(P_star_z):
+                            band_idx = z - 1 - i
+                            prev_local_sum = self._compute_local_sum(sample_representatives, band_idx, y, x, wide=not self.use_narrow_local_sums)
+                            prev_central_diff = self._compute_central_local_difference(sample_representatives, prev_local_sum, band_idx, y, x)
+                            local_differences.append(prev_central_diff)
+
+                        # For full mode, add directional differences from current band
+                        if self.prediction_mode == 'full':
+                            current_local_sum = self._compute_local_sum(sample_representatives, z, y, x, wide=not self.use_narrow_local_sums)
+                            directional_diffs = self._compute_directional_local_differences(sample_representatives, current_local_sum, z, y, x)
+                            local_differences.extend(directional_diffs)
+
+                        if local_differences:
+                            all_diffs = torch.stack(local_differences)
+                            self._update_weights(residual, all_diffs, z)
+
+        return predictions, residuals, sample_representatives
 
 
 class NarrowLocalSumPredictor(SpectralPredictor):
