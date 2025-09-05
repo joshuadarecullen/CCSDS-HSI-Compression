@@ -10,7 +10,10 @@ from .ccsds_compressor import (
     CCSDS123Compressor,
     create_lossless_compressor,
     create_near_lossless_compressor,
-    decompress,
+    decompress
+)
+
+from .metrics import (
     calculate_psnr,
     calculate_mssim,
     calculate_spectral_angle

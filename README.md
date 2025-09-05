@@ -33,7 +33,7 @@ This implementation includes all major components of Issue 2 of the CCSDS-123.0-
 
 ```python
 import torch
-from ccsds import create_lossless_compressor, decompress
+from src.ccsds import create_lossless_compressor, decompress
 
 # Create test image [Z, Y, X]
 image = torch.randn(10, 64, 64) * 100  # 10 bands, 64x64 pixels
@@ -41,20 +41,27 @@ image = torch.randn(10, 64, 64) * 100  # 10 bands, 64x64 pixels
 # Create lossless compressor
 compressor = create_lossless_compressor(num_bands=10, dynamic_range=16)
 
-# Compress to get complete compressed representation
-compressed_data = compressor.compress(image)
-print(f"Compression ratio: {compressed_data['compression_statistics']['compression_ratio']:.2f}:1")
-print(f"Compressed size: {len(compressed_data['compressed_bitstream'])} bytes")
+# Compress image - returns results dictionary with all compression outputs
+results = compressor(image)
 
-# Decompress to reconstruct image
-reconstructed = decompress(compressed_data)
+print(f"Compression ratio: {results['compression_ratio']:.2f}:1")
+print(f"Compressed size: {results['compressed_size']} bits")
+print(f"Original size: {results['original_size']} bits")
+
+# Verify lossless compression
+reconstructed = results['reconstructed_samples']
 print(f"Lossless: max error = {torch.max(torch.abs(image - reconstructed))}")
+
+# For full decompression from bitstream (if available)
+if 'compressed_bitstream' in results:
+    decompressed = decompress(results)
+    print(f"Decompressed max error = {torch.max(torch.abs(image - decompressed))}")
 ```
 
 ### Near-Lossless Compression with Quality Assessment
 
 ```python
-from ccsds import create_near_lossless_compressor, calculate_psnr, calculate_mssim, calculate_spectral_angle
+from src.ccsds import create_near_lossless_compressor, calculate_psnr, calculate_mssim, calculate_spectral_angle
 
 # Set absolute error limits per band
 error_limits = torch.tensor([2.0, 2.0, 4.0, 4.0, 8.0])  # Varying by band
@@ -66,12 +73,13 @@ compressor = create_near_lossless_compressor(
     absolute_error_limits=error_limits
 )
 
-# Compress and get quality metrics
-compressed_data = compressor.compress(image[:5])  # Use first 5 bands
-reconstructed = compressed_data['intermediate_data']['reconstructed_samples']
+# Compress image - returns comprehensive results
+results = compressor(image[:5])  # Use first 5 bands
+reconstructed = results['reconstructed_samples']
 
-print(f"Compression ratio: {compressed_data['compression_statistics']['compression_ratio']:.2f}:1")
+print(f"Compression ratio: {results['compression_ratio']:.2f}:1")
 print(f"Max error: {torch.max(torch.abs(image[:5] - reconstructed))}")
+print(f"Compression time: {results['compression_time']:.4f}s")
 
 # Calculate quality metrics with callbacks
 def quality_callback(metric_name, value, additional_data=None):
@@ -88,7 +96,7 @@ sam = calculate_spectral_angle(image[:5], reconstructed,
 ### Advanced Configuration
 
 ```python
-from ccsds import CCSDS123Compressor
+from src.ccsds import CCSDS123Compressor
 
 # Create compressor with custom parameters
 compressor = CCSDS123Compressor(
@@ -108,7 +116,10 @@ compressor.set_compression_parameters(
     update_interval=500
 )
 
-compressed_data = compressor.compress(image)
+# Compress with configured parameters
+results = compressor(image)
+print(f"Advanced compression ratio: {results['compression_ratio']:.2f}:1")
+print(f"Throughput: {results.get('throughput_samples_per_sec', 0):.0f} samples/sec")
 ```
 
 ## Command Line Interface
@@ -144,38 +155,39 @@ ccsds-benchmark --error-limits 1 2 4 8
 ## Project Structure
 
 ```
-ccsds/
+CCSDS-HSI-Compression/
 ├── src/
-│   ├── ccsds/                      # Core CCSDS-123.0-B-2 implementation
-│   │   ├── __init__.py              # Package interface
-│   │   ├── ccsds_compressor.py      # Main compressor with compression/decompression
-│   │   ├── predictor.py             # Adaptive linear predictor
-│   │   ├── quantizer.py             # Uniform quantizer with error limits
-│   │   ├── entropy_coder.py         # Hybrid entropy coder
-│   │   ├── sample_representative.py # Sample representative calculation
-│   │   └── cli.py                   # Command-line interface
-│   └── optimized/                   # Performance-optimized implementations
-│       ├── __init__.py
-│       ├── optimized_compressor.py  # GPU-accelerated compressor
-│       ├── batch_optimized_compressor.py  # Batch processing
-│       ├── optimized_predictor.py   # Optimized predictor
-│       ├── optimized_quantizer.py   # Optimized quantizer
-│       └── optimized_entropy_coder.py     # Optimized entropy coding
+│   ├── ccsds/                         # Core CCSDS-123.0-B-2 implementation  
+│   │   ├── __init__.py                # Package interface with main exports
+│   │   ├── ccsds_compressor.py        # Main CCSDS123Compressor class
+│   │   ├── predictor.py               # SpectralPredictor & NarrowLocalSumPredictor
+│   │   ├── quantizer.py               # UniformQuantizer & LosslessQuantizer
+│   │   ├── entropy_coder.py           # HybridEntropyCoder & encode_image
+│   │   ├── sample_representative.py   # SampleRepresentativeCalculator
+│   │   ├── cli.py                     # Command-line interface tools
+│   │   └── metrics/                   # Quality assessment metrics
+│   │       ├── __init__.py            # Metrics package interface
+│   │       └── quality_metrics.py     # PSNR, MSSIM, SAM implementations
+│   └── optimized/                     # Performance-optimized implementations
+│       ├── __init__.py                # Optimized package interface
+│       ├── optimized_compressor.py    # OptimizedCCSDS123Compressor
+│       ├── batch_optimized_compressor.py  # BatchOptimizedCCSDS123Compressor
+│       ├── optimized_entropy_coder.py     # OptimizedHybridEntropyCoder
+│       └── ...                        # Other optimized components
 ├── tests/
-│   ├── unit/                        # Unit tests for components
-│   │   ├── test_ccsds.py           # Main test suite
-│   │   ├── test_components.py      # Individual component tests
-│   │   └── test_*.py               # Additional unit tests
-│   └── performance/                 # Performance benchmarks
-│       ├── test_speed_comparison.py # Speed benchmarks
-│       ├── test_quick_speed.py     # Quick performance tests
-│       └── test_minimal_speed.py   # Minimal benchmarks
-├── examples/
-│   └── gpu_optimized_example.py    # GPU optimization examples
-├── docs/                            # Documentation
-├── setup.py                         # Package setup (legacy)
+│   ├── unit/                          # Unit tests for all components
+│   │   ├── test_ccsds.py             # Main CCSDS compressor tests
+│   │   ├── test_lossless.py          # Lossless compression tests
+│   │   ├── test_optimized_basic.py   # Basic optimized compressor tests
+│   │   ├── test_performance.py       # Performance comparison tests
+│   │   └── test_*.py                 # Additional unit tests
+│   ├── performance/                   # Performance benchmarks
+│   │   ├── test_speed_comparison.py  # Comprehensive speed benchmarks
+│   │   └── test_quick_speed.py       # Quick performance tests
+│   └── utils.py                      # Test utilities
+├── examples/                         # Usage examples (Jupyter notebooks)
+├── environment.yaml                  # Conda environment specification
 ├── pyproject.toml                   # Modern Python packaging
-├── requirements.txt                 # Dependencies
 └── README.md                        # This file
 ```
 
@@ -220,20 +232,22 @@ pytest --cov=src tests/
 Run individual test files:
 
 ```bash
-python tests/unit/test_ccsds.py
-python tests/performance/test_speed_comparison.py
+python tests/unit/test_ccsds.py                # Main CCSDS compressor tests
+python tests/unit/test_lossless.py             # Focused lossless compression tests
+python tests/unit/test_optimized_basic.py      # Basic optimized compressor tests
+python tests/performance/test_speed_comparison.py  # Comprehensive speed benchmarks
+python tests/performance/test_quick_speed.py   # Quick performance tests
 ```
 
 The test suite includes:
-- Lossless compression verification with decompression
-- Near-lossless compression with different error limits  
-- Sample representative parameter effects
-- Relative error limit testing
-- Narrow local sums predictor
-- Compression performance analysis
-- Quality metrics validation (PSNR, MSSIM, SAM)
-- Entropy coding integration tests
-- Bitstream compression and reconstruction
+- **Core functionality**: Lossless and near-lossless compression verification
+- **Component testing**: Individual predictor, quantizer, entropy coder tests
+- **Quality metrics**: PSNR, MSSIM, and Spectral Angle Mapper validation
+- **Optimization testing**: GPU-accelerated and batch-optimized compressor tests
+- **Performance analysis**: Speed comparisons and throughput measurements
+- **Device compatibility**: CPU/CUDA device handling and tensor management
+- **Error handling**: Robust fallback mechanisms and device mismatch resolution
+- **Standards compliance**: CCSDS-123.0-B-2 specification adherence
 
 ## Implementation Notes
 
@@ -269,18 +283,43 @@ The test suite includes:
 - Supports 32-bit dynamic range (vs 16-bit in Issue 1)
 - Includes periodic error limit updating capability
 
-## New Features
+## Current Implementation Status
 
-### Complete Compression Pipeline
-- **Entropy Encoder**: Fully integrated hybrid entropy coder with automatic high/low entropy classification
-- **Decompression**: Complete decompression function to reconstruct images from compressed bitstreams
-- **Quality Assessment**: Callback-style functions for PSNR, MSSIM, and Spectral Angle Mapper calculations
-- **Enhanced Documentation**: Mathematical explanations for all compression stages
-- **Type Safety**: Complete type annotations for all methods and functions
+### Core CCSDS-123.0-B-2 Features ✅
+- **Complete compression pipeline**: Prediction → Quantization → Sample Representatives → Entropy Coding
+- **Lossless compression**: Verified zero-error reconstruction with `create_lossless_compressor()`
+- **Near-lossless compression**: User-specified error limits with `create_near_lossless_compressor()`
+- **Adaptive linear predictor**: Full 3D spatial-spectral neighborhood prediction
+- **Hybrid entropy coder**: 16 low-entropy codes + GPO2 high-entropy codes
+- **Sample representatives**: Configurable φ, ψ, Θ parameters for improved compression
+- **Quality metrics**: PSNR, MSSIM, and Spectral Angle Mapper with callback support
+
+### Performance Optimizations ✅
+- **GPU acceleration**: CUDA-optimized compressor with automatic device management
+- **Vectorized operations**: Batch processing for improved throughput
+- **Memory efficiency**: Streaming entropy coding for large images
+- **Device compatibility**: Automatic CPU/CUDA tensor placement and error handling
+- **Multiple optimization modes**: Full, causal, and streaming processing options
+
+### Recent Improvements
+- **Fixed import errors** in all test files with proper `src.ccsds` import paths
+- **Resolved device mismatch issues** in optimized entropy coder with automatic device detection
+- **Enhanced test coverage** with comprehensive lossless, optimized, and performance tests
+- **Organized metrics module** separated quality assessment functions (PSNR, MSSIM, SAM) into dedicated `src.ccsds.metrics` package
+- **Type annotations** throughout the codebase for better development experience
+- **Mathematical documentation** explaining the theoretical foundation of each component
 
 ### Quality Metrics
 
+The package includes comprehensive quality assessment metrics for evaluating compression performance. These metrics are organized in the `src.ccsds.metrics` module and can be imported directly from the main package:
+
 ```python
+# Import metrics from main package (recommended)
+from src.ccsds import calculate_psnr, calculate_mssim, calculate_spectral_angle
+
+# Or import directly from metrics module
+from src.ccsds.metrics import calculate_psnr, calculate_mssim, calculate_spectral_angle
+
 # Calculate PSNR with callback
 def psnr_callback(psnr_value, mse_value):
     print(f"PSNR: {psnr_value:.2f} dB (MSE: {mse_value:.6f})")
@@ -306,11 +345,12 @@ sam = calculate_spectral_angle(original, reconstructed, callback=sam_callback)
 
 This is a research implementation with some simplifications:
 
-1. **Entropy Coding**: Low-entropy code tables are generated algorithmically rather than using exact tables from the standard
-2. **Weight Adaptation**: Uses simplified weight update rules
-3. **Error Limit Updates**: Basic adaptive strategy rather than sophisticated rate control
-4. **Full Bitstream Decoding**: Entropy decoding implementation is simplified (uses intermediate data for reconstruction)
-5. **Supplementary Information**: Tables not supported
+1. **Low-entropy code implementation**: While the exact code specifications from Table 1 are used, the actual encoding/decoding logic uses algorithmically generated codes rather than pre-computed lookup tables
+2. **Weight adaptation**: Uses simplified weight update rules in the predictor rather than the full adaptive strategy from the standard
+3. **Error limit updates**: Implements basic periodic updating (`PeriodicErrorLimitUpdater`) rather than sophisticated rate control algorithms
+4. **Full bitstream decoding**: The `decompress()` function currently relies on intermediate data from compression results rather than full entropy decoding from bitstream bytes
+5. **Supplementary information**: Reserved bits and supplementary information tables are not supported
+6. **Exact standard compliance**: Some algorithmic details may differ from the exact CCSDS specification to prioritize clarity and educational value
 
 ## Performance
 
