@@ -8,6 +8,11 @@ implementation, including unit tests, performance tests, and integration tests.
 # Test discovery and utilities
 import os
 import sys
+from .utils import generate_simple_test_image
+
+__all__ = [
+        'generate_simple_test_image'
+        ]
 
 # Add src directory to path for testing
 test_dir = os.path.dirname(__file__)

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
-from typing import Dict, Optional, Tuple, Union, Callable, Any, List
+from typing import Dict, Optional, Union, Callable, Any
 
 from .predictor import SpectralPredictor, NarrowLocalSumPredictor
 from .quantizer import UniformQuantizer, LosslessQuantizer, PeriodicErrorLimitUpdater
@@ -56,7 +56,8 @@ class CCSDS123Compressor(nn.Module):
         dynamic_range: int = 16,
         prediction_bands: Optional[int] = None,
         use_narrow_local_sums: bool = False,
-        lossless: bool = True
+        lossless: bool = True,
+        entropy_coder_type: str = 'hybrid'
     ) -> None:
         """
         Initialize CCSDS-123.0-B-2 compressor
@@ -94,7 +95,7 @@ class CCSDS123Compressor(nn.Module):
         self.sample_rep_calc = OptimizedSampleRepresentative(num_bands)
 
         # Initialize entropy coder
-        self.entropy_coder = HybridEntropyCoder(num_bands)
+        self.entropy_coder = encode_image
 
         # Error limit updater for near-lossless compression
         self.error_limit_updater = PeriodicErrorLimitUpdater()
@@ -106,7 +107,7 @@ class CCSDS123Compressor(nn.Module):
             'sample_rep_phi': None,
             'sample_rep_psi': None,
             'sample_rep_theta': 4.0,
-            'entropy_coder_type': 'hybrid',  # 'hybrid', 'sample_adaptive', 'block_adaptive'
+            'entropy_coder_type': entropy_coder_type,  # 'hybrid', 'sample_adaptive', 'block_adaptive'
             'periodic_error_update': False,
             'update_interval': 1000
         }
@@ -228,6 +229,7 @@ class CCSDS123Compressor(nn.Module):
         sample_count = 0
 
         # Process image sample by sample in causal order
+        print("\nStarting Predictor Quantization...")
         for z in range(Z):
             for y in range(Y):
                 for x in range(X):
@@ -307,10 +309,12 @@ class CCSDS123Compressor(nn.Module):
                         all_sample_reps[z, y, x] = reconstructed
                         sample_representatives[z, y, x] = reconstructed
 
+        print("Completed Predictor and Quantization...")
+
         # Entropy encode mapped indices
         compressed_size = 0
         if self.compression_params['entropy_coder_type'] == 'hybrid':
-            compressed_data = encode_image(all_mapped_indices, self.num_bands)
+            compressed_data = self.entropy_coder(all_mapped_indices, self.num_bands)
             compressed_size = len(compressed_data) * 8  # Convert bytes to bits
 
         return {
@@ -565,7 +569,7 @@ def calculate_psnr(original: torch.Tensor, reconstructed: torch.Tensor,
 
 
 def calculate_mssim(original: torch.Tensor, reconstructed: torch.Tensor,
-                    window_size: int = 11, callback: Optional[Callable] = None) -> float:
+                    window_size: int = 11) -> float:
     """
     Calculate Mean Structural Similarity Index Measure (MSSIM) between images
 
@@ -622,14 +626,10 @@ def calculate_mssim(original: torch.Tensor, reconstructed: torch.Tensor,
 
     mssim = float(np.mean(ssim_values))
 
-    if callback is not None:
-        callback(mssim, ssim_values)
-
     return mssim
 
 
-def calculate_spectral_angle(original: torch.Tensor, reconstructed: torch.Tensor,
-                            callback: Optional[Callable] = None) -> float:
+def calculate_spectral_angle(original: torch.Tensor, reconstructed: torch.Tensor) -> float:
     """
     Calculate Spectral Angle Mapper (SAM) between original and reconstructed spectra
 
@@ -680,8 +680,5 @@ def calculate_spectral_angle(original: torch.Tensor, reconstructed: torch.Tensor
                 sam_values.append(0.0)
 
     mean_sam = float(np.mean(sam_values)) if sam_values else 0.0
-
-    if callback is not None:
-        callback(mean_sam, sam_values)
 
     return mean_sam

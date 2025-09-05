@@ -13,52 +13,13 @@ import sys
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-# Add parent directory to path for imports
-sys.path.append(str(Path(__file__).parent.parent))
+# Add project root to path for imports
+project_root = Path(__file__).parent.parent.parent
+sys.path.append(str(project_root))
 
-from ccsds_compressor import create_lossless_compressor
-from optimized_compressor import create_optimized_lossless_compressor
-
-
-def generate_test_image(num_bands, height, width, dynamic_range=16, seed=42):
-    """Generate reproducible test image"""
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    
-    # Create spectral patterns with spatial structure
-    image = torch.zeros(num_bands, height, width)
-    
-    for z in range(num_bands):
-        # Wavelength-dependent response
-        wavelength_factor = (z + 1) / num_bands
-        
-        # Create spatial patterns
-        y_coords, x_coords = torch.meshgrid(torch.arange(height), torch.arange(width), indexing='ij')
-        
-        # Multiple frequency components
-        spatial_pattern = (
-            torch.sin(2 * np.pi * x_coords / width * 2) * 
-            torch.cos(2 * np.pi * y_coords / height * 1.5) * 30 +
-            torch.exp(-((x_coords - width//2)**2 + (y_coords - height//2)**2) / (width * height * 0.2)) * 50 +
-            wavelength_factor * 100
-        )
-        
-        # Add inter-band correlation
-        if z > 0:
-            spatial_pattern += image[z-1] * 0.3
-        
-        # Add controlled noise
-        noise = torch.randn_like(spatial_pattern) * 5
-        image[z] = spatial_pattern + noise
-    
-    # Scale to dynamic range
-    max_val = 2**(dynamic_range - 1) - 1
-    min_val = -2**(dynamic_range - 1) if dynamic_range > 1 else 0
-    
-    image = (image - image.min()) / (image.max() - image.min())
-    image = image * (max_val - min_val) + min_val
-    
-    return image.round()
+from src.ccsds import create_lossless_compressor
+from src.optimized import create_optimized_lossless_compressor
+from tests.utils import generate_test_image
 
 
 def time_compression(compressor, image, num_runs=3):

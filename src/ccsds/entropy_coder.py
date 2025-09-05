@@ -1,9 +1,5 @@
 import torch
-import torch.nn as nn
-import numpy as np
-from typing import List, Tuple, Optional
-import struct
-
+from typing import List, Dict, Any, Tuple, Optional, Union
 
 class HybridEntropyCoder:
     """
@@ -19,7 +15,7 @@ class HybridEntropyCoder:
     - Suffix-free codes instead of prefix-free
     """
 
-    def __init__(self, num_bands, rescale_interval=64):
+    def __init__(self, num_bands: int, rescale_interval: int = 64) -> None:
         self.num_bands = num_bands
         self.rescale_interval = rescale_interval
 
@@ -36,7 +32,7 @@ class HybridEntropyCoder:
         # Compressed bitstream buffer
         self.compressed_bits = []
 
-    def _initialize_low_entropy_codes(self):
+    def _initialize_low_entropy_codes(self) -> List['LowEntropyCode']:
         """
         Initialize the 16 variable-to-variable length low-entropy codes
         Based on Table 1 from the paper
@@ -69,7 +65,7 @@ class HybridEntropyCoder:
 
         return codes
 
-    def update_statistics(self, mapped_index, band):
+    def update_statistics(self, mapped_index: Union[int, float], band: int) -> None:
         """
         Update code selection statistics for a band
 
@@ -92,7 +88,7 @@ class HybridEntropyCoder:
             lsb = int(self.high_res_accumulators[band]) & 1
             self.compressed_bits.append(lsb)
 
-    def classify_entropy(self, band):
+    def classify_entropy(self, band: int) -> Tuple[bool, int]:
         """
         Classify sample as high-entropy or low-entropy based on statistics
 
@@ -120,7 +116,7 @@ class HybridEntropyCoder:
             code_index = min(int(mean_ratio), 15)
             return False, code_index
 
-    def encode_high_entropy(self, mapped_index, code_index):
+    def encode_high_entropy(self, mapped_index: int, code_index: int) -> List[int]:
         """
         Encode high-entropy sample using GPO2-equivalent code
 
@@ -152,7 +148,7 @@ class HybridEntropyCoder:
 
         return unary_bits + binary_bits
 
-    def encode_low_entropy(self, mapped_indices, code_index):
+    def encode_low_entropy(self, mapped_indices: List[int], code_index: int) -> Optional[List[int]]:
         """
         Encode sequence of low-entropy samples using variable-to-variable code
 
@@ -169,7 +165,7 @@ class HybridEntropyCoder:
         code = self.low_entropy_codes[code_index]
         return code.encode(mapped_indices)
 
-    def encode_escape_symbol(self, residual_value):
+    def encode_escape_symbol(self, residual_value: int) -> List[int]:
         """
         Encode residual value for escape symbols in low-entropy codes
 
@@ -194,7 +190,7 @@ class HybridEntropyCoder:
             # Standard unary encoding
             return [1] * residual_value + [0]
 
-    def encode_samples(self, mapped_indices, band):
+    def encode_samples(self, mapped_indices: torch.Tensor, band: int) -> List[int]:
         """
         Encode a sequence of samples for a given band
 
@@ -266,7 +262,12 @@ class LowEntropyCode:
     Individual low-entropy variable-to-variable length code
     """
 
-    def __init__(self, code_index, input_limit, num_codewords, max_input_len, max_output_len):
+    def __init__(self,
+                 code_index: int,
+                 input_limit: int,
+                 num_codewords: int,
+                 max_input_len: int,
+                 max_output_len: int) -> None:
         self.code_index = code_index
         self.input_limit = input_limit  # L_i
         self.num_codewords = num_codewords
@@ -277,7 +278,7 @@ class LowEntropyCode:
         self.input_to_output = self._generate_codeword_table()
         self.input_buffer = []
 
-    def _generate_codeword_table(self):
+    def _generate_codeword_table(self) -> Dict[Tuple[int, ...], List[int]]:
         """
         Generate simplified codeword mapping table
         In practice, these would be specified exactly by the standard
@@ -320,7 +321,7 @@ class LowEntropyCode:
 
         return table
 
-    def encode(self, input_symbols):
+    def encode(self, input_symbols: List[int]) -> Optional[List[int]]:
         """
         Encode sequence of input symbols
 
@@ -355,7 +356,7 @@ class LowEntropyCode:
 
         return None  # No complete codeword yet
 
-    def _encode_residual(self, residual):
+    def _encode_residual(self, residual: int) -> List[int]:
         """
         Encode residual value for escape symbol
         """
@@ -378,12 +379,12 @@ class BitWriter:
     Utility class for writing compressed bits to byte stream
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.buffer = bytearray()
         self.bit_buffer = 0
         self.bit_count = 0
 
-    def write_bit(self, bit):
+    def write_bit(self, bit: int) -> None:
         """Write a single bit"""
         self.bit_buffer = (self.bit_buffer << 1) | (bit & 1)
         self.bit_count += 1
@@ -393,12 +394,12 @@ class BitWriter:
             self.bit_buffer = 0
             self.bit_count = 0
 
-    def write_bits(self, bits):
+    def write_bits(self, bits: List[int]) -> None:
         """Write a list of bits"""
         for bit in bits:
             self.write_bit(bit)
 
-    def flush(self):
+    def flush(self) -> bytes:
         """Flush remaining bits with padding"""
         if self.bit_count > 0:
             # Pad with zeros
@@ -408,7 +409,7 @@ class BitWriter:
         return bytes(self.buffer)
 
 
-def encode_image(mapped_indices, num_bands):
+def encode_image(mapped_indices: torch.Tensor, num_bands: int) -> bytes:
     """
     Main function to encode an entire image
 

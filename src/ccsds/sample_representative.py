@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import numpy as np
+from typing import Optional, Union
 
 
 class SampleRepresentativeCalculator(nn.Module):
@@ -12,7 +12,7 @@ class SampleRepresentativeCalculator(nn.Module):
     and the predicted sample value, controlled by user parameters φ_z, ψ_z, Θ.
     """
 
-    def __init__(self, num_bands):
+    def __init__(self, num_bands: int) -> None:
         super().__init__()
         self.num_bands = num_bands
 
@@ -23,7 +23,7 @@ class SampleRepresentativeCalculator(nn.Module):
         self.register_buffer('psi', torch.zeros(num_bands))     # ψ_z parameters
         self.register_buffer('theta', torch.tensor(4.0))        # Θ parameter
 
-    def set_parameters(self, phi=None, psi=None, theta=None):
+    def set_parameters(self, phi: Optional[torch.Tensor] = None, psi: Optional[torch.Tensor] = None, theta: Optional[Union[int, float]] = None) -> None:
         """
         Set sample representative calculation parameters
 
@@ -39,7 +39,7 @@ class SampleRepresentativeCalculator(nn.Module):
         if theta is not None:
             self.theta = torch.tensor(float(theta))
 
-    def compute_quantizer_bin_center(self, original_sample, predicted_sample, max_error):
+    def compute_quantizer_bin_center(self, original_sample: torch.Tensor, predicted_sample: torch.Tensor, max_error: torch.Tensor) -> torch.Tensor:
         """
         Compute the center of the quantizer bin s'_z(t)
 
@@ -69,7 +69,7 @@ class SampleRepresentativeCalculator(nn.Module):
 
         return bin_center
 
-    def compute_sample_representative(self, bin_center, predicted_sample, z):
+    def compute_sample_representative(self, bin_center: torch.Tensor, predicted_sample: torch.Tensor, z: int) -> torch.Tensor:
         """
         Compute sample representative s''_z(t) using user parameters
 
@@ -104,7 +104,7 @@ class SampleRepresentativeCalculator(nn.Module):
 
         return representative
 
-    def forward(self, original_samples, predicted_samples, max_errors):
+    def forward(self, original_samples: torch.Tensor, predicted_samples: torch.Tensor, max_errors: torch.Tensor) -> torch.Tensor:
         """
         Compute sample representatives for all samples
 
@@ -148,7 +148,7 @@ class OptimizedSampleRepresentative(SampleRepresentativeCalculator):
     Optimized version that processes bands in parallel where possible
     """
 
-    def forward(self, original_samples, predicted_samples, max_errors):
+    def forward(self, original_samples: torch.Tensor, predicted_samples: torch.Tensor, max_errors: torch.Tensor) -> torch.Tensor:
         """
         Vectorized computation of sample representatives
         """
@@ -203,7 +203,7 @@ class AdaptiveSampleRepresentative(SampleRepresentativeCalculator):
     Adaptive version that can learn optimal parameters during compression
     """
 
-    def __init__(self, num_bands):
+    def __init__(self, num_bands: int) -> None:
         super().__init__(num_bands)
 
         # Track prediction accuracy with different parameter settings
@@ -212,7 +212,7 @@ class AdaptiveSampleRepresentative(SampleRepresentativeCalculator):
         self.adaptation_interval = 100
         self.adaptation_count = 0
 
-    def adapt_parameters(self, prediction_errors, z):
+    def adapt_parameters(self, prediction_errors: torch.Tensor, z: int) -> None:
         """
         Adapt φ_z and ψ_z parameters based on prediction accuracy
 

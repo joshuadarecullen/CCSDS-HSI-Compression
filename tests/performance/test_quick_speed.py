@@ -11,18 +11,24 @@ import time
 import numpy as np
 from typing import Dict, List
 
+# Add project root to path for imports
+import sys
+from pathlib import Path
+project_root = Path(__file__).parent.parent.parent
+sys.path.append(str(project_root))
+
 # Import compressors
 try:
-    from ccsds_compressor import CCSDS123Compressor
+    from src.ccsds import CCSDS123Compressor
     ORIGINAL_AVAILABLE = True
 except ImportError:
     ORIGINAL_AVAILABLE = False
     print("Warning: Original CCSDS compressor not available")
 
-from optimized_compressor import create_optimized_lossless_compressor
+from src.optimized import create_optimized_lossless_compressor
 
 try:
-    from batch_optimized_compressor import BatchOptimizedCCSDS123Compressor
+    from src.optimized import BatchOptimizedCCSDS123Compressor
     BATCH_AVAILABLE = True
 except ImportError:
     BATCH_AVAILABLE = False

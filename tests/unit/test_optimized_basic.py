@@ -10,9 +10,10 @@ import sys
 from pathlib import Path
 
 # Add parent directory to path for imports
-sys.path.append(str(Path(__file__).parent.parent))
+project_root = Path(__file__).parent.parent.parent
+sys.path.append(str(project_root))
 
-from optimized_compressor import create_optimized_lossless_compressor
+from src.optimized import create_optimized_lossless_compressor
 
 
 def generate_simple_image(num_bands=3, height=8, width=8):
@@ -65,6 +66,9 @@ def test_optimized_basic():
 
         # Check results
         reconstructed = results['reconstructed_samples']
+        # Ensure both tensors are on the same device for comparison
+        if reconstructed.device != image.device:
+            image = image.to(reconstructed.device)
         max_error = torch.max(torch.abs(image - reconstructed))
 
         print(f"  Compression time: {compression_time:.4f}s")
@@ -117,7 +121,11 @@ def test_scaling():
         print(f"  Compression ratio: {results['compression_ratio']:.2f}:1")
 
         # Quick lossless verification
-        max_error = torch.max(torch.abs(image - results['reconstructed_samples']))
+        reconstructed = results['reconstructed_samples']
+        # Ensure both tensors are on the same device for comparison
+        if reconstructed.device != image.device:
+            image = image.to(reconstructed.device)
+        max_error = torch.max(torch.abs(image - reconstructed))
         if max_error < 0.01:
             print(f"  ✓ Lossless")
         else:
@@ -162,7 +170,11 @@ def test_large_band_count():
         print(f"  Throughput: {throughput:.0f} samples/sec")
 
         # Quick verification
-        max_error = torch.max(torch.abs(image - results['reconstructed_samples']))
+        reconstructed = results['reconstructed_samples']
+        # Ensure both tensors are on the same device for comparison
+        if reconstructed.device != image.device:
+            image = image.to(reconstructed.device)
+        max_error = torch.max(torch.abs(image - reconstructed))
         print(f"  Max error: {max_error:.6f}")
 
         if throughput > 10000:  # Good performance threshold
@@ -171,6 +183,7 @@ def test_large_band_count():
             print(f"  ⚠ Performance could be better")
 
     return True
+
 
 def run_optimized_tests():
     """Run optimized implementation tests"""
@@ -206,12 +219,13 @@ def run_optimized_tests():
         traceback.print_exc()
         return False
 
+
 def run_optimized_test():
     """Run optimized implementation tests"""
     try:
         test1 = test_optimized_basic()
 
-        if test1 and test2 and test3:
+        if test1:
             print(f"\n{'='*60}")
             print("OPTIMIZED IMPLEMENTATION SUCCESS!")
             print("=" * 60)
@@ -240,6 +254,6 @@ def run_optimized_test():
 
 
 if __name__ == "__main__":
-    # success = run_optimized_tests()
-    success = run_optimized_test()
+    success = run_optimized_tests()
+    # success = run_optimized_test()
     sys.exit(0 if success else 1)

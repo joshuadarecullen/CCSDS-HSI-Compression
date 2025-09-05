@@ -1,12 +1,9 @@
+from tests.utils import generate_test_image
 import sys
 import os
-import torch
 
 # Get the parent directory and add it to sys.path
 sys.path.append(os.path.abspath(".."))
-
-from test_ccsds import generate_test_image
-
 
 print("\nTesting generating image\n")
 

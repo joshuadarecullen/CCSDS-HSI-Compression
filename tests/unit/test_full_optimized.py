@@ -14,40 +14,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 from optimized_compressor import create_optimized_lossless_compressor
-
-
-def generate_test_image(num_bands=5, height=16, width=16, seed=42):
-    """Generate reproducible test image with spectral correlation"""
-    torch.manual_seed(seed)
-
-    image = torch.zeros(num_bands, height, width)
-
-    # Create spatially and spectrally correlated patterns
-    for z in range(num_bands):
-        # Base spatial pattern
-        y_coords, x_coords = torch.meshgrid(torch.arange(height), torch.arange(width), indexing='ij')
-
-        # Spectral-dependent patterns
-        wavelength_factor = (z + 1) / num_bands
-
-        spatial_pattern = (
-            torch.sin(2 * torch.pi * x_coords / width * 2) *
-            torch.cos(2 * torch.pi * y_coords / height * 1.5) * 20 +
-            wavelength_factor * 50
-        )
-
-        # Add inter-band correlation for better compression
-        if z > 0:
-            spatial_pattern += image[z-1] * 0.3
-
-        # Add controlled noise
-        noise = torch.randn_like(spatial_pattern) * 2
-        image[z] = spatial_pattern + noise
-
-    # Scale to reasonable range
-    image = (image - image.min()) / (image.max() - image.min()) * 200 + 50
-
-    return image.round().float()
+from tests.utils import generate_simple_test_image as generate_test_image
 
 
 def test_fully_optimized_compression():

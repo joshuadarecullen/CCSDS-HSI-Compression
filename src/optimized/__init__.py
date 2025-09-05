@@ -8,18 +8,24 @@ and vectorized operations.
 
 # Import optimized components when available
 try:
-    from .optimized_compressor import OptimizedCCSDS123Compressor
-    from .batch_optimized_compressor import BatchOptimizedCCSDS123
+    from .optimized_compressor import (
+            OptimizedCCSDS123Compressor,
+            create_optimized_near_lossless_compressor,
+            create_optimized_lossless_compressor
+     )
+    from .batch_optimized_compressor import BatchOptimizedCCSDS123Compressor
     from .optimized_predictor import OptimizedSpectralPredictor
     from .optimized_quantizer import OptimizedUniformQuantizer
     from .optimized_entropy_coder import OptimizedHybridEntropyCoder
     
     __all__ = [
-        'OptimizedCCSDS123Compressor',
-        'BatchOptimizedCCSDS123',
+        'BatchOptimizedCCSDS123Compressor',
         'OptimizedSpectralPredictor',
         'OptimizedUniformQuantizer', 
-        'OptimizedHybridEntropyCoder'
+        'OptimizedHybridEntropyCoder',
+        'OptimizedCCSDS123Compressor',
+        'create_optimized_near_lossless_compressor',
+        'create_optimized_lossless_compressor'
     ]
     
 except ImportError as e:

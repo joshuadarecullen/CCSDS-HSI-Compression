@@ -6,14 +6,14 @@ Tests only the lossless compression functionality with minimal overhead.
 """
 
 import torch
-import numpy as np
 import sys
 from pathlib import Path
 
-# Add parent directory to path for imports
-sys.path.append(str(Path(__file__).parent.parent))
+# Add project root to path for imports
+project_root = Path(__file__).parent.parent.parent
+sys.path.append(str(project_root))
 
-from ccsds_compressor import create_lossless_compressor
+from src.ccsds import create_lossless_compressor
 
 
 def generate_simple_test_image(num_bands=3, height=16, width=16, dynamic_range=12):
@@ -279,7 +279,8 @@ def run_lossless_test():
         traceback.print_exc()
         return False
 
+
 if __name__ == "__main__":
-    # success = run_lossless_tests()
-    success = run_lossless_test()
+    success = run_lossless_tests()
+    # success = run_lossless_test()
     sys.exit(0 if success else 1)

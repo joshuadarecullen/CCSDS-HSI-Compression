@@ -1,7 +1,6 @@
 import torch
-import torch.nn as nn
 import numpy as np
-from typing import Dict, Optional, Tuple, Union, List
+from typing import Dict, Optional, Tuple, List
 import time
 
 from .optimized_compressor import OptimizedCCSDS123Compressor
@@ -16,7 +15,8 @@ class BatchOptimizedCCSDS123Compressor(OptimizedCCSDS123Compressor):
     Supports both single images and batches with automatic detection.
     """
 
-    def _validate_input_batch(self, image: torch.Tensor) -> Tuple[torch.Tensor, bool]:
+    def _validate_input_batch(self,
+                              image: torch.Tensor) -> Tuple[torch.Tensor, bool]:
         """Validate input and detect batch processing"""
         is_batch = False
 

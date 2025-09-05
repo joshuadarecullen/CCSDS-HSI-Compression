@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple
 import time
 from torch.cuda.amp import autocast, GradScaler
 
@@ -56,16 +56,16 @@ class OptimizedCCSDS123Compressor(nn.Module):
         self.dynamic_range = dynamic_range
         self.lossless = lossless
         self.optimization_mode = optimization_mode
-        
+
         # GPU optimization settings
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.use_mixed_precision = use_mixed_precision and torch.cuda.is_available()
         self.gpu_memory_fraction = gpu_memory_fraction
-        
+
         # Initialize mixed precision scaler
         if self.use_mixed_precision:
             self.scaler = GradScaler()
-        
+
         # GPU memory management
         self._setup_gpu_memory()
 
@@ -93,8 +93,8 @@ class OptimizedCCSDS123Compressor(nn.Module):
         self._last_throughput = 0.0
 
         # Optimized entropy coder
-        self.entropy_coder = OptimizedHybridEntropyCoder(num_bands)
-        
+        self.entropy_coder = OptimizedHybridEntropyCoder(num_bands, device=self.device)
+
         # Move all components to device
         self.to(self.device)
 
@@ -115,11 +115,11 @@ class OptimizedCCSDS123Compressor(nn.Module):
         if torch.cuda.is_available() and self.device.type == 'cuda':
             torch.cuda.set_per_process_memory_fraction(self.gpu_memory_fraction)
             torch.cuda.empty_cache()
-    
+
     def _to_device(self, tensor: torch.Tensor, non_blocking: bool = True) -> torch.Tensor:
         """Move tensor to device with optional non-blocking transfer"""
         return tensor.to(self.device, non_blocking=non_blocking)
-    
+
     def _clear_gpu_cache(self):
         """Clear GPU cache to free memory"""
         if torch.cuda.is_available() and self.device.type == 'cuda':
@@ -163,19 +163,19 @@ class OptimizedCCSDS123Compressor(nn.Module):
     def forward_gpu_batch_optimized(self, image: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         GPU-optimized batch processing with mixed precision support
-        
+
         Processes multiple bands in parallel on GPU for maximum throughput.
         Uses mixed precision when available for additional speedup.
         """
         start_time = time.time()
-        
+
         # Validate input and move to device
         image = self._validate_input(image)
         Z, Y, X = image.shape
-        
+
         # Determine optimal batch size for GPU memory
         gpu_batch_size = min(self.compression_params.get('gpu_batch_size', 8), Z)
-        
+
         # Initialize output tensors on GPU
         with torch.no_grad():
             predictions = torch.zeros_like(image, device=self.device)
@@ -183,23 +183,23 @@ class OptimizedCCSDS123Compressor(nn.Module):
             quantized_residuals = torch.zeros_like(image, device=self.device)
             mapped_indices = torch.zeros(Z, Y, X, dtype=torch.long, device=self.device)
             reconstructed_samples = torch.zeros_like(image, device=self.device)
-        
+
         # Process bands in batches
         total_compressed_size = 0
         entropy_stats = {}
-        
+
         for batch_start in range(0, Z, gpu_batch_size):
             batch_end = min(batch_start + gpu_batch_size, Z)
-            
+
             # Extract batch
             image_batch = image[batch_start:batch_end]
-            
+
             # Use mixed precision if available
             if self.use_mixed_precision:
                 with autocast():
                     # Batch prediction
                     pred_batch, res_batch = self._process_batch_prediction(image_batch)
-                    
+
                     # Batch quantization
                     quant_res_batch, mapped_batch, recon_batch = self._process_batch_quantization(
                         res_batch, pred_batch
@@ -208,27 +208,27 @@ class OptimizedCCSDS123Compressor(nn.Module):
                 with torch.no_grad():
                     # Batch prediction
                     pred_batch, res_batch = self._process_batch_prediction(image_batch)
-                    
+
                     # Batch quantization
                     quant_res_batch, mapped_batch, recon_batch = self._process_batch_quantization(
                         res_batch, pred_batch
                     )
-            
+
             # Store results
             predictions[batch_start:batch_end] = pred_batch
             residuals[batch_start:batch_end] = res_batch
             quantized_residuals[batch_start:batch_end] = quant_res_batch
             mapped_indices[batch_start:batch_end] = mapped_batch
             reconstructed_samples[batch_start:batch_end] = recon_batch
-            
+
             # Batch entropy coding (approximate for now)
             batch_size_estimate = torch.mean(mapped_batch.float()).item() * mapped_batch.numel() * 4
             total_compressed_size += int(batch_size_estimate)
-            
+
             # Clear GPU cache between batches
             if batch_end < Z:
                 self._clear_gpu_cache()
-        
+
         # Sample representatives
         if not self.lossless:
             with torch.no_grad():
@@ -238,15 +238,15 @@ class OptimizedCCSDS123Compressor(nn.Module):
                 )
         else:
             sample_representatives = reconstructed_samples
-        
+
         # Final cleanup
         self._clear_gpu_cache()
-        
+
         # Track performance
         end_time = time.time()
         self._last_compression_time = end_time - start_time
         self._last_throughput = (Z * Y * X) / self._last_compression_time
-        
+
         return {
             'predictions': predictions,
             'residuals': residuals,
@@ -261,13 +261,13 @@ class OptimizedCCSDS123Compressor(nn.Module):
             'throughput_samples_per_sec': self._last_throughput,
             'entropy_stats': entropy_stats
         }
-    
+
     def _process_batch_prediction(self, image_batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Process prediction for a batch of bands"""
         # Use the existing predictor but with GPU-optimized operations
         predictions, residuals = self.predictor.forward_optimized(image_batch)
         return predictions, residuals
-    
+
     def _process_batch_quantization(self, residuals: torch.Tensor, predictions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Process quantization for a batch of bands"""
         # Use the existing quantizer but ensure GPU operations
@@ -370,7 +370,6 @@ class OptimizedCCSDS123Compressor(nn.Module):
         quantized_residuals, mapped_indices, reconstructed_samples = self.quantizer.forward_optimized(
             residuals, predictions
         )
-
         # Sample representatives
         if not self.lossless:
             max_errors = self.quantizer.compute_max_errors_vectorized(predictions)
@@ -483,22 +482,22 @@ class OptimizedCCSDS123Compressor(nn.Module):
             'compression_ratio': (Z * Y * X * self.dynamic_range) / max(total_compressed_size, 1),
             'compression_time': self._last_compression_time,
             'throughput_samples_per_sec': self._last_throughput,
-            'entropy_stats': entropy_stats
+            # 'entropy_stats': entropy_stats
         }
 
     def forward_gpu_streaming(self, image: torch.Tensor, chunk_size=(8, 64, 64)) -> Dict[str, torch.Tensor]:
         """
         GPU-optimized streaming compression with memory management
-        
+
         Processes very large images in GPU-friendly chunks while maintaining
         optimal memory usage and throughput.
         """
         start_time = time.time()
-        
+
         # Validate input and move to device
         image = self._validate_input(image)
         Z, Y, X = image.shape
-        
+
         # Initialize output tensors on device
         with torch.no_grad():
             predictions = torch.zeros_like(image, device=self.device)
@@ -506,10 +505,10 @@ class OptimizedCCSDS123Compressor(nn.Module):
             quantized_residuals = torch.zeros_like(image, device=self.device)
             mapped_indices = torch.zeros(Z, Y, X, dtype=torch.long, device=self.device)
             reconstructed_samples = torch.zeros_like(image, device=self.device)
-        
+
         Z_chunk, Y_chunk, X_chunk = chunk_size
         total_compressed_size = 0
-        
+
         # Process in GPU-optimized chunks
         for z_start in range(0, Z, Z_chunk):
             for y_start in range(0, Y, Y_chunk):
@@ -517,10 +516,10 @@ class OptimizedCCSDS123Compressor(nn.Module):
                     z_end = min(z_start + Z_chunk, Z)
                     y_end = min(y_start + Y_chunk, Y)
                     x_end = min(x_start + X_chunk, X)
-                    
+
                     # Extract chunk
                     chunk = image[z_start:z_end, y_start:y_end, x_start:x_end]
-                    
+
                     # Process chunk with mixed precision if available
                     if self.use_mixed_precision:
                         with autocast():
@@ -534,21 +533,21 @@ class OptimizedCCSDS123Compressor(nn.Module):
                             quant_res_chunk, mapped_chunk, recon_chunk = self._process_batch_quantization(
                                 res_chunk, pred_chunk
                             )
-                    
+
                     # Store chunk results
                     predictions[z_start:z_end, y_start:y_end, x_start:x_end] = pred_chunk
                     residuals[z_start:z_end, y_start:y_end, x_start:x_end] = res_chunk
                     quantized_residuals[z_start:z_end, y_start:y_end, x_start:x_end] = quant_res_chunk
                     mapped_indices[z_start:z_end, y_start:y_end, x_start:x_end] = mapped_chunk
                     reconstructed_samples[z_start:z_end, y_start:y_end, x_start:x_end] = recon_chunk
-                    
+
                     # Estimate compressed size
                     chunk_size_estimate = torch.mean(mapped_chunk.float()).item() * mapped_chunk.numel() * 4
                     total_compressed_size += int(chunk_size_estimate)
-                    
+
                     # Clear cache between chunks
                     self._clear_gpu_cache()
-        
+
         # Sample representatives
         if not self.lossless:
             with torch.no_grad():
@@ -558,15 +557,15 @@ class OptimizedCCSDS123Compressor(nn.Module):
                 )
         else:
             sample_representatives = reconstructed_samples
-        
+
         # Final cleanup
         self._clear_gpu_cache()
-        
+
         # Track performance
         end_time = time.time()
         self._last_compression_time = end_time - start_time
         self._last_throughput = (Z * Y * X) / self._last_compression_time
-        
+
         return {
             'predictions': predictions,
             'residuals': residuals,
@@ -697,7 +696,6 @@ class OptimizedCCSDS123Compressor(nn.Module):
 
         return results
 
-
 def create_optimized_lossless_compressor(
     num_bands: int,
     optimization_mode: str = 'full',
@@ -723,7 +721,7 @@ def create_optimized_lossless_compressor(
     # Auto-detect device
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
+
     compressor = OptimizedCCSDS123Compressor(
         num_bands=num_bands,
         lossless=True,
@@ -732,10 +730,10 @@ def create_optimized_lossless_compressor(
         use_mixed_precision=use_mixed_precision,
         **kwargs
     )
-    
+
     # Set GPU-specific parameters
     compressor.set_compression_parameters(gpu_batch_size=gpu_batch_size)
-    
+
     return compressor
 
 
@@ -768,7 +766,7 @@ def create_optimized_near_lossless_compressor(
     # Auto-detect device
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
+
     compressor = OptimizedCCSDS123Compressor(
         num_bands=num_bands,
         lossless=False,

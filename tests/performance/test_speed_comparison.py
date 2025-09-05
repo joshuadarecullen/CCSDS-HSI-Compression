@@ -18,14 +18,19 @@ import pandas as pd
 from typing import Dict, List, Tuple, Optional
 import sys
 import os
+from pathlib import Path
+
+# Add project root to path for imports
+project_root = Path(__file__).parent.parent.parent
+sys.path.append(str(project_root))
 
 # Import all compressor variants
-from ccsds_compressor import CCSDS123Compressor  # Original implementation
-from optimized_compressor import (
+from src.ccsds import CCSDS123Compressor  # Original implementation
+from src.optimized import (
     OptimizedCCSDS123Compressor,
-    create_optimized_lossless_compressor
+    create_optimized_lossless_compressor,
+    BatchOptimizedCCSDS123Compressor
 )
-from batch_optimized_compressor import BatchOptimizedCCSDS123Compressor
 
 
 class SpeedBenchmark:
