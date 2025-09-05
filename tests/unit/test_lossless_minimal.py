@@ -10,9 +10,9 @@ import sys
 from pathlib import Path
 
 # Add parent directory to path for imports
-sys.path.append(str(Path(__file__).parent.parent))
+sys.path.append(str(Path(__file__).parent.parent.parent))
 
-from ccsds_compressor import create_lossless_compressor
+from src.ccsds.ccsds_compressor import create_lossless_compressor
 
 
 def test_minimal_lossless():

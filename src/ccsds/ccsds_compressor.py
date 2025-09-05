@@ -4,10 +4,10 @@ import numpy as np
 import math
 from typing import Dict, Optional, Tuple, Union, Callable, Any, List
 
-from predictor import SpectralPredictor, NarrowLocalSumPredictor
-from quantizer import UniformQuantizer, LosslessQuantizer, PeriodicErrorLimitUpdater
-from sample_representative import SampleRepresentativeCalculator, OptimizedSampleRepresentative
-from entropy_coder import HybridEntropyCoder, encode_image, BitWriter
+from .predictor import SpectralPredictor, NarrowLocalSumPredictor
+from .quantizer import UniformQuantizer, LosslessQuantizer, PeriodicErrorLimitUpdater
+from .sample_representative import SampleRepresentativeCalculator, OptimizedSampleRepresentative
+from .entropy_coder import HybridEntropyCoder, encode_image, BitWriter
 
 
 class CCSDS123Compressor(nn.Module):

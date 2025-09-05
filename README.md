@@ -33,7 +33,7 @@ This implementation includes all major components of Issue 2 of the CCSDS-123.0-
 
 ```python
 import torch
-from ccsds_compressor import create_lossless_compressor, decompress
+from ccsds import create_lossless_compressor, decompress
 
 # Create test image [Z, Y, X]
 image = torch.randn(10, 64, 64) * 100  # 10 bands, 64x64 pixels
@@ -54,7 +54,7 @@ print(f"Lossless: max error = {torch.max(torch.abs(image - reconstructed))}")
 ### Near-Lossless Compression with Quality Assessment
 
 ```python
-from ccsds_compressor import create_near_lossless_compressor, calculate_psnr, calculate_mssim, calculate_spectral_angle
+from ccsds import create_near_lossless_compressor, calculate_psnr, calculate_mssim, calculate_spectral_angle
 
 # Set absolute error limits per band
 error_limits = torch.tensor([2.0, 2.0, 4.0, 4.0, 8.0])  # Varying by band
@@ -88,7 +88,7 @@ sam = calculate_spectral_angle(image[:5], reconstructed,
 ### Advanced Configuration
 
 ```python
-from ccsds_compressor import CCSDS123Compressor
+from ccsds import CCSDS123Compressor
 
 # Create compressor with custom parameters
 compressor = CCSDS123Compressor(
@@ -111,23 +111,117 @@ compressor.set_compression_parameters(
 compressed_data = compressor.compress(image)
 ```
 
-## File Structure
+## Command Line Interface
 
-- `predictor.py` - Adaptive linear predictor implementation
-- `quantizer.py` - Uniform quantizer with error limit control
-- `sample_representative.py` - Sample representative calculation
-- `entropy_coder.py` - Hybrid entropy coder with low-entropy codes
-- `ccsds_compressor.py` - Main compressor pipeline with entropy encoding, decompression, and quality assessment
-- `test_ccsds.py` - Comprehensive test suite
-- `requirements.txt` - Python dependencies
+The package includes command-line tools for easy compression and benchmarking:
+
+### Compression Tool
+
+```bash
+# Lossless compression
+ccsds-compress input.npy output.pt --lossless
+
+# Near-lossless compression
+ccsds-compress input.npy output.pt --error-limit 2.0
+
+# With verbose output
+ccsds-compress input.npy output.pt --lossless --verbose
+```
+
+### Benchmarking Tool
+
+```bash
+# Run standard benchmark
+ccsds-benchmark
+
+# Custom benchmark parameters
+ccsds-benchmark --bands 20 --height 128 --width 128 --iterations 10
+
+# Test specific error limits
+ccsds-benchmark --error-limits 1 2 4 8
+```
+
+## Project Structure
+
+```
+ccsds/
+├── src/
+│   ├── ccsds/                      # Core CCSDS-123.0-B-2 implementation
+│   │   ├── __init__.py              # Package interface
+│   │   ├── ccsds_compressor.py      # Main compressor with compression/decompression
+│   │   ├── predictor.py             # Adaptive linear predictor
+│   │   ├── quantizer.py             # Uniform quantizer with error limits
+│   │   ├── entropy_coder.py         # Hybrid entropy coder
+│   │   ├── sample_representative.py # Sample representative calculation
+│   │   └── cli.py                   # Command-line interface
+│   └── optimized/                   # Performance-optimized implementations
+│       ├── __init__.py
+│       ├── optimized_compressor.py  # GPU-accelerated compressor
+│       ├── batch_optimized_compressor.py  # Batch processing
+│       ├── optimized_predictor.py   # Optimized predictor
+│       ├── optimized_quantizer.py   # Optimized quantizer
+│       └── optimized_entropy_coder.py     # Optimized entropy coding
+├── tests/
+│   ├── unit/                        # Unit tests for components
+│   │   ├── test_ccsds.py           # Main test suite
+│   │   ├── test_components.py      # Individual component tests
+│   │   └── test_*.py               # Additional unit tests
+│   └── performance/                 # Performance benchmarks
+│       ├── test_speed_comparison.py # Speed benchmarks
+│       ├── test_quick_speed.py     # Quick performance tests
+│       └── test_minimal_speed.py   # Minimal benchmarks
+├── examples/
+│   └── gpu_optimized_example.py    # GPU optimization examples
+├── docs/                            # Documentation
+├── setup.py                         # Package setup (legacy)
+├── pyproject.toml                   # Modern Python packaging
+├── requirements.txt                 # Dependencies
+└── README.md                        # This file
+```
+
+## Installation
+
+### From Source (Development)
+
+```bash
+# Clone the repository
+git clone <repository-url>
+cd ccsds
+
+# Install in development mode
+pip install -e .
+
+# Or install with optional dependencies
+pip install -e ".[dev,gpu,benchmarks]"
+```
+
+### Using pip (when published)
+
+```bash
+pip install ccsds-123-compressor
+```
 
 ## Testing
 
 Run the complete test suite:
 
 ```bash
-pip install -r requirements.txt
-python test_ccsds.py
+# Run all tests
+pytest tests/
+
+# Run specific test categories
+pytest tests/unit/          # Unit tests
+pytest tests/performance/   # Performance tests
+
+# Run with coverage
+pytest --cov=src tests/
+```
+
+Run individual test files:
+
+```bash
+python tests/unit/test_ccsds.py
+python tests/performance/test_speed_comparison.py
 ```
 
 The test suite includes:

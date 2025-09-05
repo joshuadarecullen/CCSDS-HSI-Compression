@@ -4,8 +4,8 @@ import numpy as np
 from typing import Dict, Optional, Tuple, Union, List
 import time
 
-from optimized_compressor import OptimizedCCSDS123Compressor
-from optimized_entropy_coder import encode_image_optimized, encode_image_streaming
+from .optimized_compressor import OptimizedCCSDS123Compressor
+from .optimized_entropy_coder import encode_image_optimized, encode_image_streaming
 
 
 class BatchOptimizedCCSDS123Compressor(OptimizedCCSDS123Compressor):

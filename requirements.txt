@@ -1,3 +1,16 @@
+# Core dependencies for CCSDS-123.0-B-2 Compressor
 torch>=1.9.0
-numpy>=1.19.0
+numpy>=1.20.0
 matplotlib>=3.3.0
+
+# Optional: Development dependencies
+# Uncomment for development setup
+# pytest>=6.0.0
+# pytest-cov>=2.0.0
+# black>=21.0.0
+# flake8>=3.8.0
+# mypy>=0.812
+
+# Optional: Performance profiling
+# memory_profiler>=0.60.0
+# line_profiler>=3.0.0

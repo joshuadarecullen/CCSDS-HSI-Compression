@@ -19,10 +19,15 @@ import sys
 # Add current directory to path for imports
 # sys.path.append(str(Path(__file__).parent))
 
-from ccsds_compressor import CCSDS123Compressor, create_lossless_compressor, create_near_lossless_compressor
-from predictor import SpectralPredictor
-from quantizer import UniformQuantizer
-from sample_representative import SampleRepresentativeCalculator
+# Add parent directory to path for imports
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent.parent))
+
+from src.ccsds.ccsds_compressor import CCSDS123Compressor, create_lossless_compressor, create_near_lossless_compressor
+from src.ccsds.predictor import SpectralPredictor
+from src.ccsds.quantizer import UniformQuantizer
+from src.ccsds.sample_representative import SampleRepresentativeCalculator
 
 
 def generate_test_image(num_bands=10, height=64, width=64, dynamic_range=16, noise_level=0.1):

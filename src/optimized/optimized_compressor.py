@@ -5,10 +5,10 @@ from typing import Dict, Optional, Tuple, Union
 import time
 from torch.cuda.amp import autocast, GradScaler
 
-from optimized_predictor import OptimizedSpectralPredictor, CausalOptimizedPredictor
-from optimized_quantizer import OptimizedUniformQuantizer, OptimizedLosslessQuantizer
-from sample_representative import OptimizedSampleRepresentative
-from optimized_entropy_coder import encode_image_optimized, encode_image_streaming, OptimizedHybridEntropyCoder
+from .optimized_predictor import OptimizedSpectralPredictor, CausalOptimizedPredictor
+from .optimized_quantizer import OptimizedUniformQuantizer, OptimizedLosslessQuantizer
+from ..ccsds.sample_representative import OptimizedSampleRepresentative
+from .optimized_entropy_coder import encode_image_optimized, encode_image_streaming, OptimizedHybridEntropyCoder
 
 
 class OptimizedCCSDS123Compressor(nn.Module):
