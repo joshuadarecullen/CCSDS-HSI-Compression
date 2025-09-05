@@ -1,2 +1,4 @@
 /__pycache__
+/examples/.ipynb_checkpoints
 *.pyc
+/.claude
