@@ -1,8 +1,20 @@
 """
 CCSDS-121.0-B-2 Rice Coder Implementation
 
+⭐ RECOMMENDED FOR BLOCK-ADAPTIVE ENTROPY CODING ⭐
+
 This module implements the Rice coder as specified in CCSDS-121.0-B-2
 for block-adaptive entropy coding as referenced in CCSDS-123.0-B-2 Issue 2.
+
+Key Features:
+- CCSDS121BlockAdaptiveEntropyCoder: Full CCSDS-123.0-B-2 compliant block-adaptive entropy coding
+- Complete CCSDS-121.0-B-2 Rice coding implementation
+- Proper bit-level operations with BitWriter/BitReader integration
+- Standards-compliant block partitioning and parameter selection
+
+This is the recommended implementation for CCSDS-123.0-B-2 Issue 2 
+block-adaptive entropy coding, providing full standards compliance
+compared to the simplified BlockAdaptiveEntropyCoder in entropy_coder.py.
 """
 
 import torch
@@ -151,8 +163,22 @@ class CCSDS121BlockAdaptiveEntropyCoder:
     """
     CCSDS-121.0-B-2 Block-Adaptive Entropy Coder
 
+    ⭐ RECOMMENDED IMPLEMENTATION FOR BLOCK-ADAPTIVE ENTROPY CODING ⭐
+
+    This is the fully CCSDS-123.0-B-2 compliant block-adaptive entropy coder
+    that implements Rice coding as specified in CCSDS-121.0-B-2.
+
     Implements block-adaptive Rice coding as referenced in CCSDS-123.0-B-2 Issue 2.
     This provides the third entropy coding option alongside sample-adaptive and hybrid coders.
+
+    Full Standards Compliance Features:
+    - Exact CCSDS-121.0-B-2 Rice coding implementation
+    - Proper block partitioning and parameter selection
+    - BitWriter integration for exact bit-level operations
+    - Complete compression statistics and metadata
+
+    Use this implementation instead of BlockAdaptiveEntropyCoder from entropy_coder.py
+    for production applications requiring full CCSDS-123.0-B-2 compliance.
     """
 
     def __init__(self, block_size: Tuple[int, int] = (16, 16)):

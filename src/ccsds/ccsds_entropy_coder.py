@@ -1,6 +1,9 @@
 """
 CCSDS-123.0-B-2 Hybrid Entropy Coder - Complete Implementation
 
+⭐ RECOMMENDED IMPLEMENTATION ⭐
+This is the most CCSDS-123.0-B-2 compliant entropy coder implementation.
+
 This module implements the exact hybrid entropy coder as specified in
 Section 5.2 of the CCSDS-123.0-B-2 standard, including:
 - Exact GPO2 codes from Section 5.2.2.2
@@ -8,6 +11,11 @@ Section 5.2 of the CCSDS-123.0-B-2 standard, including:
 - Proper code selection thresholds from Table 5-15
 - Reverse-order decoding support
 - Complete flush code procedures
+- Proper integer accumulators and bit-level operations
+- Full standards compliance with equation-by-equation implementation
+
+For production use, prefer this implementation over entropy_coder.py
+which provides a simpler but less standards-compliant alternative.
 """
 
 import torch

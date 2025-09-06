@@ -1,19 +1,45 @@
+"""
+CCSDS-123.0-B-2 Hybrid Entropy Coder - Simplified Implementation
+
+⚠️  LEGACY IMPLEMENTATION ⚠️
+For full CCSDS-123.0-B-2 compliance, use ccsds_entropy_coder.py instead.
+
+This module provides a simplified entropy coder implementation with:
+- Basic GPO2 codes
+- Simplified low-entropy code support
+- Float64 accumulators (vs proper integer accumulators)
+- Fixed entropy threshold (vs proper accumulator-based selection)
+- Missing some advanced features (flush codes, full reverse-order decoding)
+
+This implementation works but is less compliant with the exact CCSDS-123.0-B-2
+specification compared to the complete implementation in ccsds_entropy_coder.py.
+Use this for educational purposes or when simplified operation is preferred.
+"""
+
 import torch
 from typing import List, Dict, Any, Tuple, Optional, Union
 from .low_entropy_tables import LOW_ENTROPY_TABLES, CompleteLowEntropyCode
 
 class HybridEntropyCoder:
     """
-    CCSDS-123.0-B-2 Hybrid Entropy Coder
+    CCSDS-123.0-B-2 Hybrid Entropy Coder - Simplified Implementation
 
-    Combines length-limited Golomb-Power-of-2 (GPO2) codes with 16 new
-    variable-to-variable length "low-entropy" codes for better compression
-    of low-entropy data.
+    ⚠️  For full standards compliance, use CCSDS123HybridEntropyCoder 
+        from ccsds_entropy_coder.py instead.
+
+    This simplified implementation combines length-limited Golomb-Power-of-2 
+    (GPO2) codes with 16 variable-to-variable length "low-entropy" codes.
 
     Key features:
     - Adaptive code selection based on sample statistics
     - Decoding in reverse order for memory efficiency
     - Suffix-free codes instead of prefix-free
+    
+    Limitations compared to full implementation:
+    - Uses float64 accumulators instead of proper integer accumulators
+    - Fixed entropy threshold vs accumulator-based selection
+    - Missing advanced flush code procedures
+    - Less complete reverse-order decoding support
     """
 
     def __init__(self, num_bands: int, rescale_interval: int = 64) -> None:
@@ -518,17 +544,30 @@ def encode_image(mapped_indices: torch.Tensor, num_bands: int) -> bytes:
 
 class BlockAdaptiveEntropyCoder:
     """
-    CCSDS-123.0-B-2 Block-Adaptive Entropy Coder
+    CCSDS-123.0-B-2 Block-Adaptive Entropy Coder - Simplified Implementation
 
-    Groups samples into blocks and selects entropy codes based on block-level
-    statistics rather than sample-by-sample adaptation. This can provide
-    better compression for images with spatial structure.
+    ⚠️  LEGACY IMPLEMENTATION ⚠️
+    For full CCSDS-123.0-B-2 block-adaptive compliance, use 
+    CCSDS121BlockAdaptiveEntropyCoder from rice_coder.py instead.
+
+    This simplified implementation groups samples into blocks and selects entropy 
+    codes based on block-level statistics rather than sample-by-sample adaptation.
 
     Key features:
     - Block-based entropy estimation and code selection
     - Unified code selection per block for all samples in the block
     - Block size adaptation based on image characteristics
     - Integration with existing 16 low-entropy codes and GPO2 codes
+
+    Limitations compared to standards-compliant implementation:
+    - Uses simplified GPO2 codes instead of exact CCSDS-121.0-B-2 Rice coding
+    - Local LowEntropyCode class vs complete standard tables
+    - Missing proper accumulator management and rescaling
+    - No reverse-order decoding or flush code procedures
+
+    For production use requiring CCSDS-123.0-B-2 Issue 2 compliance,
+    use CCSDS121BlockAdaptiveEntropyCoder from rice_coder.py which implements
+    the exact CCSDS-121.0-B-2 Rice coding specification.
     """
 
     def __init__(self, num_bands: int, block_size: Tuple[int, int] = (8, 8),
