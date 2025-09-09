@@ -157,19 +157,20 @@ class CCSDS123Compressor(nn.Module):
 
     def _validate_input(self, image: torch.Tensor) -> torch.Tensor:
         """
-        Validate and preprocess input image
+        Validate and preprocess input image for CCSDS-123.0-B-2 compliance
 
-        Validates image dimensions, dynamic range compliance, and data types.
-        Handles both 3D [Z,Y,X] and 4D [1,Z,Y,X] input formats.
+        The CCSDS-123.0-B-2 standard requires D-bit integer-valued samples.
+        This method ensures proper quantization of float inputs to integer values
+        within the specified dynamic range.
 
         Args:
             image: Input multispectral/hyperspectral image tensor
 
         Returns:
-            Processed image tensor [Z, Y, X] in float32 format
+            Processed image tensor [Z, Y, X] with integer-valued samples
 
         Raises:
-            ValueError: If image dimensions or values are invalid
+            ValueError: If image dimensions are invalid
         """
         if image.dim() == 3:
             Z, Y, X = image.shape
@@ -183,14 +184,33 @@ class CCSDS123Compressor(nn.Module):
         if Z != self.num_bands:
             raise ValueError(f"Expected {self.num_bands} bands, got {Z}")
 
-        # Check dynamic range
-        max_val = 2**(self.dynamic_range - 1) - 1
-        min_val = -2**(self.dynamic_range - 1) if self.dynamic_range > 1 else 0
+        # CCSDS-123.0-B-2 requires D-bit integer samples
+        # Determine valid range based on dynamic range
+        if self.dynamic_range <= 1:
+            # Single bit: only 0,1 values allowed
+            min_val, max_val = 0, 1
+        else:
+            # Multi-bit: assume unsigned integers for typical hyperspectral data
+            # Range: [0, 2^D - 1] for D-bit unsigned integers
+            min_val, max_val = 0, 2**self.dynamic_range - 1
 
-        if torch.any(image > max_val) or torch.any(image < min_val):
-            print(f"Warning: Image values outside expected range [{min_val}, {max_val}]")
+        # Handle float inputs by quantizing to integer values
+        if image.dtype.is_floating_point:
+            # Quantize floats to integers within valid range
+            image = torch.round(image)
 
-        return image.float()
+        # Clamp values to valid range for D-bit samples
+        image = torch.clamp(image, min_val, max_val)
+
+        # Ensure integer values floats (required by CCSDS-123.0-B-2)
+        image = image.long().float()
+
+        # Verify final range compliance
+        actual_min, actual_max = image.min().item(), image.max().item()
+        if actual_min < min_val or actual_max > max_val:
+            raise ValueError(f"Image values [{actual_min}, {actual_max}] outside valid {self.dynamic_range}-bit range [{min_val}, {max_val}]")
+
+        return image
 
     def forward(self, image: torch.Tensor) -> Dict[str, Union[torch.Tensor, float, int]]:
         """

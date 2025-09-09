@@ -225,9 +225,10 @@ class HybridEntropyCoder:
             if is_high_entropy:
                 # Flush any pending low-entropy codes
                 if low_entropy_buffer and current_low_code is not None:
-                    low_bits = self.encode_low_entropy(low_entropy_buffer, current_low_code)
-                    if low_bits:
-                        compressed_bits.extend(low_bits)
+                    for buffered_index in low_entropy_buffer:
+                        low_bits = self.encode_low_entropy(buffered_index, current_low_code)
+                        if low_bits:
+                            compressed_bits.extend(low_bits)
                     low_entropy_buffer = []
                     current_low_code = None
 
@@ -240,27 +241,29 @@ class HybridEntropyCoder:
                 if current_low_code != code_index:
                     # Code changed - flush buffer with previous code
                     if low_entropy_buffer and current_low_code is not None:
-                        low_bits = self.encode_low_entropy(low_entropy_buffer, current_low_code)
-                        if low_bits:
-                            compressed_bits.extend(low_bits)
+                        for buffered_index in low_entropy_buffer:
+                            low_bits = self.encode_low_entropy(buffered_index, current_low_code)
+                            if low_bits:
+                                compressed_bits.extend(low_bits)
                     low_entropy_buffer = []
                     current_low_code = code_index
 
                 # Add to buffer
                 low_entropy_buffer.append(mapped_index_val)
 
-                # Check if we can encode this buffer
+                # Feed the new symbol to the low-entropy coder
                 if current_low_code is not None:
-                    low_bits = self.encode_low_entropy(low_entropy_buffer, current_low_code)
+                    low_bits = self.encode_low_entropy(mapped_index_val, current_low_code)
                     if low_bits:  # Complete codeword formed
                         compressed_bits.extend(low_bits)
-                        low_entropy_buffer = []
+                        # Keep the buffer for context, but don't clear it here
 
         # Flush remaining low-entropy samples
         if low_entropy_buffer and current_low_code is not None:
-            low_bits = self.encode_low_entropy(low_entropy_buffer, current_low_code)
-            if low_bits:
-                compressed_bits.extend(low_bits)
+            for buffered_index in low_entropy_buffer:
+                low_bits = self.encode_low_entropy(buffered_index, current_low_code)
+                if low_bits:
+                    compressed_bits.extend(low_bits)
 
         # Add proper tail processing
         tail_bits = self.finalize_encoding(band)

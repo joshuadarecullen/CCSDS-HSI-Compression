@@ -187,6 +187,13 @@ class LowEntropyCodeTable:
 
     def is_valid_pattern(self, code_id: int, input_pattern: Tuple[int, ...]) -> bool:
         """Check if input pattern is valid for the specified code"""
+        # Ensure input_pattern is hashable (fix for unhashable list bug)
+        if not isinstance(input_pattern, tuple):
+            if isinstance(input_pattern, list):
+                input_pattern = tuple(input_pattern)
+            else:
+                return False
+
         if code_id not in self.codes:
             return False
 
@@ -240,6 +247,10 @@ class CompleteLowEntropyCode:
         # Try to find matching codewords starting with longest patterns
         for length in range(min(len(self.input_buffer), self.max_input_len), 0, -1):
             pattern = tuple(self.input_buffer[:length])
+
+            # Ensure pattern is a tuple of integers (fix for unhashable list bug)
+            if not isinstance(pattern, tuple):
+                pattern = tuple(pattern)
 
             if self.tables.is_valid_pattern(self.code_id, pattern):
                 # Found valid codeword
