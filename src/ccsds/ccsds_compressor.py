@@ -86,7 +86,7 @@ class CCSDS123Compressor(nn.Module):
             )
         else:
             self.predictor = SpectralPredictor(
-                num_bands, dynamic_range, prediction_bands
+                num_bands, dynamic_range, prediction_bands, lossless
             )
 
         # Initialize quantizer
@@ -104,7 +104,15 @@ class CCSDS123Compressor(nn.Module):
         # Error limit updater for near-lossless compression
         self.error_limit_updater = PeriodicErrorLimitUpdater()
 
-        # Compression parameters
+        self.max_val = 2**(self.dynamic_range - 1) - 1
+        self.min_val = -2**(self.dynamic_range - 1) if self.dynamic_range > 1 else 0
+
+        # Define sample range parameters
+        # self.s_min = -2**(self.dynamic_range - 1) if self.dynamic_range > 1 else 0
+        # self.s_max = 2**(self.dynamic_range - 1) - 1
+        # self.s_mid = 2**(self.dynamic_range - 1) if self.dynamic_range > 1 else 0
+
+        # Compression parameters sort these
         self.compression_params = {
             'absolute_error_limits': None,
             'relative_error_limits': None,
@@ -338,9 +346,7 @@ class CCSDS123Compressor(nn.Module):
             reconstructed = prediction + quantized_residual
 
             # Clamp to valid range
-            max_val = 2**(self.dynamic_range - 1) - 1
-            min_val = -2**(self.dynamic_range - 1) if self.dynamic_range > 1 else 0
-            reconstructed = torch.clamp(reconstructed, min_val, max_val)
+            reconstructed = torch.clamp(reconstructed, self.min_val, self.max_val)
             all_reconstructed[z, y, x] = reconstructed
 
             # Compute sample representative for future predictions
@@ -354,7 +360,7 @@ class CCSDS123Compressor(nn.Module):
                 )
 
                 sample_rep = self.sample_rep_calc.compute_sample_representative(
-                    bin_center, prediction, z
+                    bin_center, prediction, z, max_error_single
                 )
 
                 all_sample_reps[z, y, x] = sample_rep

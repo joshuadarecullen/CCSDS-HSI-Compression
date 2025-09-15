@@ -79,7 +79,7 @@ if __name__ == "__main__":
 if __name__ == "__main__":
 
     # Replace 'path_to_your_tif_file.tif' with the actual path to your TIFF file
-    tif_path = '/home/joshua/Documents/phd_university/code/HSI code examples/aviris_hyperspectral_data/19920612_AVIRIS_IndianPine_Site3.tif'
+    tif_path = '/home/joshua/Documents/phd_university/code/avaris_data/aviris_hyperspectral_data/19920612_AVIRIS_IndianPine_Site3.tif'
 
     # Open the TIFF file
     with rasterio.open(tif_path) as src:
@@ -88,11 +88,8 @@ if __name__ == "__main__":
 
     preds = raster_scan(torch.from_numpy(cube[:4,:8,:8]).float(), predictor)
 
-    print(type(torch.from_numpy(cube)[0, 0, 1]))
-    print(preds[0, 0, 0])
     print(cube[0, 0, 0])
     print(preds[0, 0, 0].item() == cube[0, 0, 0].item())
-    print(preds)
 
 
     #TODO:
