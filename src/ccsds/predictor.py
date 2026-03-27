@@ -752,6 +752,7 @@ class SpectralPredictor(nn.Module):
                         )
                         sample_representatives[z, y, x] = sample_rep
                     else:
+                        # return original?
                         sample_representatives[z, y, x] = pred + residual
 
                     # Update weights based on prediction error according to CCSDS standard
