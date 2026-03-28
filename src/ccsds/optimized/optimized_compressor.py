@@ -7,17 +7,10 @@ from torch.cuda.amp import autocast, GradScaler
 
 from .optimized_predictor import OptimizedSpectralPredictor, CausalOptimizedPredictor
 from .optimized_quantizer import OptimizedUniformQuantizer, OptimizedLosslessQuantizer
-try:
-    from ccsds.sample_representative import OptimizedSampleRepresentative
-    from ccsds.header import CCSDS123Header, PredictorMode, EncodingOrder, SupplementaryTable, TableType, TableDimension
-    from ccsds.bitstream import BitstreamFormatter
-    from ccsds.encoding_orders import SampleIterator, EncodingOrderOptimizer
-except ImportError:
-    # Fallback to relative imports
-    from ..ccsds.sample_representative import OptimizedSampleRepresentative
-    from ..ccsds.header import CCSDS123Header, PredictorMode, EncodingOrder, SupplementaryTable, TableType, TableDimension
-    from ..ccsds.bitstream import BitstreamFormatter
-    from ..ccsds.encoding_orders import SampleIterator, EncodingOrderOptimizer
+from ..core.sample_representative import OptimizedSampleRepresentative
+from ..io import CCSDS123Header, PredictorMode, EncodingOrder, SupplementaryTable, TableType, TableDimension
+from ..entropy import BitstreamFormatter
+from ..io import SampleIterator, EncodingOrderOptimizer
 
 from .optimized_entropy_coder import (encode_image_optimized, encode_image_streaming,
                                      OptimizedHybridEntropyCoder, encode_image_block_adaptive_optimized,

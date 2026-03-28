@@ -26,7 +26,7 @@ sys.path.append(str(project_root))
 
 # Import all compressor variants
 from src.ccsds import CCSDS123Compressor  # Original implementation
-from src.optimized import (
+from src import (
     OptimizedCCSDS123Compressor,
     create_optimized_lossless_compressor,
     BatchOptimizedCCSDS123Compressor

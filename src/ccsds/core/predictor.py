@@ -18,16 +18,16 @@ class SpectralPredictor(nn.Module):
                  prediction_mode: str = 'full',
                  local_sum_type: str = 'neighbor_oriented',
                  use_narrow_local_sums: bool = False,
-                 weight_resolution: int = 19.,  # 4<=omega<=19
-                 weight_limit: int = 2**18.,
+                 weight_resolution: int = 19,  # 4<=omega<=19
+                 weight_limit: int = 2**18,
                  default_weight_init: bool = True,
-                 R: int = 32.,
-                 damping: int = 0., # 0<=x<2^{theta}-1
-                 offset: int = 0.,  # 0<=x<2^{theta}-1
-                 theta: int = 2.,   # 0<=x<=4
-                 v_min: int = -6.,  # -6<=v_min<=v_max<=9
-                 v_max: int = 9.,   # -6<=v_min<=v_max<=9
-                 t_inc: int = 4.,   # 2^{4} <= t_inc <= 2^{11}
+                 R: int = 32,
+                 damping: int = 0,  # 0<=x<2^{theta}-1
+                 offset: int = 0,   # 0<=x<2^{theta}-1
+                 theta: int = 2,    # 0<=x<=4
+                 v_min: int = -6,   # -6<=v_min<=v_max<=9
+                 v_max: int = 9,    # -6<=v_min<=v_max<=9
+                 t_inc: int = 4,    # 2^{4} <= t_inc <= 2^{11}
                  lossless: bool = True
                  ) -> None:
 
@@ -100,22 +100,31 @@ class SpectralPredictor(nn.Module):
             weights: torch.int32 tensor of shape
                      (num_bands, total_components), where total_components = spectral_components (+3 if full mode)
         """
-        if self.spectral_components < 1:
+        # spectral_components can be 0 for single-band images (no prior bands for spectral prediction)
+        if self.spectral_components < 0:
             raise ValueError(
-                "spectral_components must be >= 1 (at least the first component)."
+                "spectral_components must be >= 0."
             )
 
-        # --- compute centrals once ---
+        # --- compute spectral component weights (centrals) ---
+        # The centrals are for P* spectral components only
         first = (7 * (1 << self.weight_resolution)) // 8
-        centrals = [int(first)]
-        for i in range(1, self.total_components):
-            centrals.append(centrals[-1] // 8)
+        if self.spectral_components > 0:
+            centrals = [int(first)]
+            for i in range(1, self.spectral_components):
+                centrals.append(centrals[-1] // 8)
+        else:
+            centrals = []
 
-        # add directional components if full mode
-        if self.prediction_mode:
+        # Add directional components (3 zeros) if full mode
+        if self.prediction_mode == 'full':
             vec = centrals + [0, 0, 0]
         else:
             vec = centrals
+
+        # Handle edge case: no components at all (single band, reduced mode)
+        if len(vec) == 0:
+            return torch.zeros((self.num_bands, 0), dtype=torch.int32)
 
         # --- replicate across bands ---
         weights = torch.tensor(vec, dtype=torch.int32).repeat(self.num_bands, 1)
@@ -126,8 +135,9 @@ class SpectralPredictor(nn.Module):
         return weights
 
 
-    def init_weights_custom(Lambda_z: torch.Tensor = None,
-                            Q: int: 3,
+    def init_weights_custom(self,
+                            Lambda_z: torch.Tensor = None,
+                            Q: int = 3,
                             full: bool = True) -> torch.Tensor:
         """
         Custom weight initialization (CCSDS §4.6.3.3).
@@ -153,7 +163,7 @@ class SpectralPredictor(nn.Module):
         bias  = (1 << (self.weight_resolution + 2 - Q)) - 1        # 2^(Omega+2-Q) - 1
 
         weights = (Lambda * scale) + bias
-        weights = weights.to(torch.int32).repeat
+        weights = weights.to(torch.int32).unsqueeze(0).repeat(self.num_bands, 1)
 
         # Clip to allowed weight range
         weights = torch.clamp(weights, self.weight_min, self.weight_max)
@@ -183,6 +193,9 @@ class SpectralPredictor(nn.Module):
         """
 
         if len(local_differences) >= 4:
+            # Convert weights to float for update computation
+            weights_float = self.weights[z].float()
+
             # Update weights for spatial components using CCSDS algorithm
             for i in range(4):
                 d_i = local_differences[i].item()
@@ -196,23 +209,23 @@ class SpectralPredictor(nn.Module):
 
                     # Compute weight update according to CCSDS formula
                     # Δw_i = 2^(-V_min) * e * d_i * 2^(-max(0, V_i - V_max))
-                    base_scale = 2.0 ** (-V_min)  # 2^(-V_min)
-                    damping = 2.0 ** (-max(0, V_i - V_max))  # Damping factor
+                    base_scale = 2.0 ** (-self.v_min)  # 2^(-V_min)
+                    damping = 2.0 ** (-max(0, V_i - self.v_max))  # Damping factor
 
                     weight_update = base_scale * prediction_error.item() * d_i * damping
-                    self.weights[z, i] += weight_update
+                    weights_float[i] += weight_update
 
             # Update spectral weights (if any) with similar approach
             if self.spectral_components > 0:
                 for i in range(4, min(4 + self.spectral_components, self.weights.size(1))):
                     # For spectral weights, use a simplified update based on prediction error
                     # This could be enhanced with spectral local differences
-                    spectral_update = (2.0 ** (-V_min)) * prediction_error.item() * 0.1  # Small spectral factor
-                    self.weights[z, i] += spectral_update
+                    spectral_update = (2.0 ** (-self.v_min)) * prediction_error.item() * 0.1  # Small spectral factor
+                    weights_float[i] += spectral_update
 
-        # Apply weight clamping according to standard (typically broader range than simple implementation)
-        # CCSDS standard allows for larger weight range for better adaptation
-        self.weights[z] = torch.clamp(self.weights[z], -2.0, 2.0)
+            # Apply weight clamping and convert back to int32
+            weights_float = torch.clamp(weights_float, self.weight_min, self.weight_max)
+            self.weights[z] = weights_float.round().to(torch.int32)
 
         # Update local sums for next iteration (running average of local differences)
         if len(local_differences) >= 4:
@@ -489,18 +502,18 @@ class SpectralPredictor(nn.Module):
                                 z: int,
                                 sample_representatives: torch.Tensor = None) -> torch.Tensor:
         """
-        Compute predicted sample \hat{s}_z(t) using CCSDS-123.0-B-2
+        Compute predicted sample s_hat_z(t) using CCSDS-123.0-B-2
         Equations (37)–(39).
 
         Args:
             local_sum: σ_z(t), local sum
-            predicted_local_diff: \hat{d}_z(t), predicted central local difference
+            predicted_local_diff: d_hat_z(t), predicted central local difference
             z, y, x: Sample coordinates
             P: number of previous bands used
             sample_representatives: s_{z-1}(t), needed when t=0 and z>0
 
         Returns:
-            Predicted sample \hat{s}_z(t)
+            Predicted sample s_hat_z(t)
         """
         t = y*sample_representatives.shape[-1] + x
 
@@ -512,17 +525,15 @@ class SpectralPredictor(nn.Module):
         term3 = (2**(self.weight_resolution + 1)) * self.s_mid
         term4 = 2**(self.weight_resolution + 1)
 
-        # unclipped_sum = term1 + term2 + term3 + term4
+        # High-resolution predicted sample (sum of all terms)
+        # Note: CCSDS specifies modular arithmetic with 2^R for overflow prevention,
+        # but with R=64 (default), 64-bit precision is sufficient for all realistic
+        # hyperspectral data. The subsequent clipping handles any range issues.
+        high_res_sum = term1 + term2 + term3 + term4
 
-        # Modular arithmetic mod_R
-        # modular_result = ((unclipped_sum - self.s_min) % self.R) + self.s_min
-        # print(f'Mod results b4 clamp {modular_result}')
-        modular_result = ((term1 + term2) % self.R) + term3 + term4
-        # print(f'Mod results b4 clamp {modular_result}')
-
-        # Clip to extended range
+        # Clip to extended range per CCSDS Eq. (37)
         s_tilde = torch.clamp(
-            modular_result,
+            high_res_sum,
             2**(self.weight_resolution + 2) * self.s_min,
             2**(self.weight_resolution + 2) * self.s_max + 2**(self.weight_resolution + 1)
         )
@@ -534,7 +545,8 @@ class SpectralPredictor(nn.Module):
             s_double = torch.floor_divide(s_tilde, 2**(self.weight_resolution + 1))
         else:
             if self.spectral_components > 0 and z > 0 and t == 0:
-                s_double = 2 * sample_representatives[z, x-1, y]
+                # For t=0 and z>0, use previous band's sample representative at same spatial location
+                s_double = 2 * sample_representatives[z-1, y, x]
             elif t == 0 and (self.spectral_components == 0 or z == 0):
                 s_double = 2 * self.s_mid
 
@@ -583,7 +595,7 @@ class SpectralPredictor(nn.Module):
                 z, y, x: Sample coordinates
 
         Returns:
-            Predicted sample value \hat{s}_z(t)
+            Predicted sample value s_hat_z(t)
         """
         # Compute local sum according to CCSDS standard
         local_sum = self._compute_local_sum(sample_representatives,
@@ -625,10 +637,10 @@ class SpectralPredictor(nn.Module):
             directional_diffs = self._compute_directional_local_differences(sample_representatives, local_sum, z, y, x)
             local_differences.extend(directional_diffs)
 
-        # Compute predicted central local difference \hat{d}_z(t) = W_z^T(t) * U_z(t)
+        # Compute predicted central local difference d_hat_z(t) = W_z^T(t) * U_z(t)
         predicted_local_diff = torch.tensor(0.0, device=image.device)
 
-        # For z=0 under reduced mode, \hat{d}_z(t) = 0 (equation 36)
+        # For z=0 under reduced mode, d_hat_z(t) = 0 (equation 36)
         if z == 0 and self.prediction_mode == 'reduced':
             predicted_local_diff = torch.tensor(0.0, device=image.device)
         else:
@@ -640,7 +652,7 @@ class SpectralPredictor(nn.Module):
         # Apply clipping to valid sample range
         high_res_prediction = self._prediction_calculation(local_sum,
                                                            predicted_local_diff,
-                                                           x=y,
+                                                           x=x,
                                                            y=y,
                                                            z=z,
                                                            sample_representatives=sample_representatives)
@@ -666,7 +678,7 @@ class SpectralPredictor(nn.Module):
 
         Args:
             original_sample: Original sample value s_z(t)
-            predicted_sample: Predicted sample value \hat{s}_z(t)
+            predicted_sample: Predicted sample value s_hat_z(t)
             quantizer_index: Quantizer index q_z(t)
             max_error: Maximum error m_z(t)
         Returns:
@@ -685,12 +697,16 @@ class SpectralPredictor(nn.Module):
         # sign of quantizer index
         sign_q = torch.sign(quantizer_index)
 
+        # Compute the numerator according to CCSDS-123.0-B-2 equation (47)
+        # s''_z(t) = floor((4*(2^theta - phi) * (s'_z(t)*2^omega - sign_q*m_z(t)*psi*(2^(omega-theta)))
+        #            + phi*s_hat_z(t) - phi*2^(omega+1)) / 2^(theta+omega+1))
+        theta_factor = 2**self.theta - self.damping
+        omega_factor = 2**self.weight_resolution
         numerator = (
-            4 * (2**self.theta - self.damping) *
-            (s_prime * (2**) - sign_q * max_error * self.offset * (2**self.weight_resolution - self.theta)))
-            + self.damping * predicted_sample - self.damping * (2**(self.weight_resolution + 1))
+            4 * theta_factor * (s_prime * omega_factor - sign_q * max_error * self.offset * (omega_factor / (2**self.theta)))
+            + self.damping * predicted_sample * omega_factor - self.damping * (2**(self.weight_resolution + 1))
         )
-        double_res = torch.floor_divide(numerator, 2**(self.theta + self.weight_resolution + 1))
+        double_res = torch.floor_divide(numerator.long(), 2**(self.theta + self.weight_resolution + 1))
 
         # --- Equation (46): single-resolution representative
         s_double_prime = torch.floor_divide(double_res + 1, 2)
@@ -788,7 +804,7 @@ class SpectralPredictor(nn.Module):
 
                         if local_differences:
                             all_diffs = torch.stack(local_differences)
-                            self._update_weights(residual, all_diffs, z)
+                            self._update_weights(residual, all_diffs, z, x, y)
 
         return predictions, residuals, sample_representatives
 

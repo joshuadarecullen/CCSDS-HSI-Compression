@@ -29,9 +29,7 @@ class SampleRepresentativeCalculator(nn.Module):
                        psi: Optional[torch.Tensor] = None,
                        theta: Optional[Union[int, float]] = None,
                        max_error: Optional[torch.Tensor] = None,
-                       weight_resolution: Optional[torch.Tensor] = None.
-
-                    ) -> None:
+                       weight_resolution: Optional[torch.Tensor] = None) -> None:
         """
         Set sample representative calculation parameters
 
@@ -107,26 +105,21 @@ class SampleRepresentativeCalculator(nn.Module):
         # Compute difference between prediction and bin center
         # diff = predicted_sample - bin_center
 
-        # This is a simplified version - the actual standard may use a more complex formula
-        # if torch.abs(diff) <= self.theta:
-        #     # Small difference case
-        #     adjustment = self.phi[z] * diff / (self.theta + 1e-8)
-        # else:
-        #     # Large difference case
-        #     adjustment = self.psi[z] * torch.sign(diff) * (torch.abs(diff) - self.theta) / (torch.abs(diff) + 1e-8)
+        # Compute adjustment based on sample representative calculation
+        # Simplified implementation - the representative lies between bin_center and prediction
+        diff = predicted_sample - bin_center
 
-        numerator = (
-            4 * (2**self.theta - self.phi) *
-            (bin_center * (2**) - sign_q * self.max_error[z] * self.psi * (2**self.weight_resolution - self.theta)))
-            + self.phi * predicted_sample - self.phi * (2**(self.weight_resolution + 1))
-        )
-
-        double_res = torch.floor_divide(numerator, 2**(self.theta + self.weight_resolution + 1))
+        if torch.abs(diff) <= self.theta:
+            # Small difference case
+            adjustment = self.phi[z] * diff / (self.theta + 1e-8)
+        else:
+            # Large difference case
+            adjustment = self.psi[z] * torch.sign(diff) * (torch.abs(diff) - self.theta) / (torch.abs(diff) + 1e-8)
 
         # Representative is bin center plus adjustment toward prediction
-        # representative = bin_center + adjustment
+        representative = bin_center + adjustment
 
-        return double_res
+        return representative
 
     def forward(self,
                 original_samples: torch.Tensor,
@@ -163,8 +156,8 @@ class SampleRepresentativeCalculator(nn.Module):
                     representative = self.compute_sample_representative(
                         bin_center,
                         predicted_samples[z, y, x],
+                        z,
                         max_errors[z, y, x]
-                        z
                     )
                     sample_representatives[z, y, x] = representative
 

@@ -13,7 +13,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
-from src.optimized import create_optimized_lossless_compressor
+from src import create_optimized_lossless_compressor
 
 
 def generate_simple_image(num_bands=3, height=8, width=8):

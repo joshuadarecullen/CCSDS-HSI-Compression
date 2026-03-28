@@ -293,19 +293,41 @@ class CompleteLowEntropyCode:
         """
         output_sequences = []
 
-        while self.input_buffer:
-            # Try to encode remaining symbols
-            encoded = self.add_symbol(0)  # Dummy symbol to trigger encoding
-            if encoded:
-                output_sequences.append(encoded)
-            else:
-                # Force single symbol encoding if no pattern matches
+        # Process remaining symbols without adding new ones
+        max_iterations = len(self.input_buffer) + 10  # Safety limit
+        iteration = 0
+
+        while self.input_buffer and iteration < max_iterations:
+            iteration += 1
+
+            # Try to match and encode patterns in the remaining buffer
+            found_match = False
+            for length in range(min(len(self.input_buffer), self.max_input_len), 0, -1):
+                pattern = tuple(self.input_buffer[:length])
+
+                if self.tables.is_valid_pattern(self.code_id, pattern):
+                    output_bits = self.tables.encode_pattern(self.code_id, pattern)
+
+                    # Handle escape symbols
+                    escape_bits = []
+                    for symbol in pattern:
+                        if symbol > self.input_limit:
+                            residual = symbol - self.input_limit - 1
+                            escape_bits.extend(self._encode_escape(residual))
+
+                    # Remove processed symbols from buffer
+                    self.input_buffer = self.input_buffer[length:]
+
+                    if output_bits:
+                        output_sequences.append(escape_bits + output_bits)
+                    found_match = True
+                    break
+
+            if not found_match:
+                # No pattern found - encode single symbol using escape mechanism
                 if self.input_buffer:
                     symbol = self.input_buffer.pop(0)
-                    single_pattern = (symbol,)
-                    if self.tables.is_valid_pattern(self.code_id, single_pattern):
-                        output_bits = self.tables.encode_pattern(self.code_id, single_pattern)
-                        if output_bits:
-                            output_sequences.append(output_bits)
+                    escape_bits = self._encode_escape(symbol)
+                    output_sequences.append(escape_bits)
 
         return output_sequences

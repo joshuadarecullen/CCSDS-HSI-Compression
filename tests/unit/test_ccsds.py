@@ -17,10 +17,14 @@ import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-from src.ccsds.ccsds_compressor import CCSDS123Compressor, create_lossless_compressor, create_near_lossless_compressor
-from src.ccsds.predictor import SpectralPredictor
-from src.ccsds.quantizer import UniformQuantizer
-from src.ccsds.sample_representative import SampleRepresentativeCalculator
+from src.ccsds import (
+    CCSDS123Compressor,
+    create_lossless_compressor,
+    create_near_lossless_compressor,
+    SpectralPredictor,
+    UniformQuantizer,
+    SampleRepresentativeCalculator
+)
 from tests.utils import generate_test_image
 
 

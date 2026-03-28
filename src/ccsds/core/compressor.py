@@ -7,11 +7,11 @@ from typing import Dict, Optional, Union, Callable, Any, Tuple
 from .predictor import SpectralPredictor, NarrowLocalSumPredictor
 from .quantizer import UniformQuantizer, LosslessQuantizer, PeriodicErrorLimitUpdater
 from .sample_representative import SampleRepresentativeCalculator, OptimizedSampleRepresentative
-from .entropy_coder import HybridEntropyCoder, encode_image, BitWriter, BlockAdaptiveEntropyCoder
-from .rice_coder import CCSDS121BlockAdaptiveEntropyCoder, encode_image_rice
-from .header import CCSDS123Header, PredictorMode, EncodingOrder
-from .bitstream import BitstreamFormatter, BitWriter
-from .encoding_orders import SampleIterator, EncodingOrderOptimizer
+from ..entropy import HybridEntropyCoder, encode_image, BitWriter, BlockAdaptiveEntropyCoder
+from ..entropy import CCSDS121BlockAdaptiveEntropyCoder, encode_image_rice
+from ..io import CCSDS123Header, PredictorMode, EncodingOrder
+from ..entropy import BitstreamFormatter
+from ..io import SampleIterator, EncodingOrderOptimizer
 
 
 class CCSDS123Compressor(nn.Module):
@@ -193,21 +193,33 @@ class CCSDS123Compressor(nn.Module):
             raise ValueError(f"Expected {self.num_bands} bands, got {Z}")
 
         # CCSDS-123.0-B-2 requires D-bit integer samples
-        # Determine valid range based on dynamic range
+        # The predictor uses signed range: [-2^(D-1), 2^(D-1)-1]
         if self.dynamic_range <= 1:
             # Single bit: only 0,1 values allowed
             min_val, max_val = 0, 1
+            offset = 0
         else:
-            # Multi-bit: assume unsigned integers for typical hyperspectral data
-            # Range: [0, 2^D - 1] for D-bit unsigned integers
-            min_val, max_val = 0, 2**self.dynamic_range - 1
+            # Multi-bit signed range
+            min_val = -2**(self.dynamic_range - 1)
+            max_val = 2**(self.dynamic_range - 1) - 1
+            offset = 2**(self.dynamic_range - 1)  # Offset for unsigned->signed conversion
 
         # Handle float inputs by quantizing to integer values
         if image.dtype.is_floating_point:
-            # Quantize floats to integers within valid range
             image = torch.round(image)
 
-        # Clamp values to valid range for D-bit samples
+        # Auto-detect unsigned input and convert to signed range
+        # If all values are non-negative and some exceed s_max, assume unsigned
+        actual_min = image.min().item()
+        actual_max = image.max().item()
+        if actual_min >= 0 and actual_max > max_val and self.dynamic_range > 1:
+            # Unsigned input [0, 2^D-1] -> convert to signed [-2^(D-1), 2^(D-1)-1]
+            image = image - offset
+            self._unsigned_input = True
+        else:
+            self._unsigned_input = False
+
+        # Clamp values to valid signed range for D-bit samples
         image = torch.clamp(image, min_val, max_val)
 
         # Ensure integer values floats (required by CCSDS-123.0-B-2)
@@ -266,10 +278,10 @@ class CCSDS123Compressor(nn.Module):
         # Determine encoding order
         encoding_order = self.compression_params.get('encoding_order', 'BSQ')
         if encoding_order == 'BI':
-            from .encoding_orders import EncodingOrder as EO
+            from ..io import EncodingOrder as EO
             sample_order = EO.BAND_INTERLEAVED
         else:
-            from .encoding_orders import EncodingOrder as EO
+            from ..io import EncodingOrder as EO
             sample_order = EO.BAND_SEQUENTIAL
 
         # Create sample iterator for the specified encoding order
@@ -388,13 +400,19 @@ class CCSDS123Compressor(nn.Module):
             compressed_data, entropy_stats = block_coder.encode_image_block_adaptive(all_mapped_indices)
             compressed_size = entropy_stats.get('total_compressed_bits', 0)
 
+        # Convert reconstructed samples back to unsigned if input was unsigned
+        output_reconstructed = all_reconstructed
+        if hasattr(self, '_unsigned_input') and self._unsigned_input:
+            offset = 2**(self.dynamic_range - 1)
+            output_reconstructed = all_reconstructed + offset
+
         return {
             'predictions': all_predictions,
             'residuals': all_residuals,
             'quantized_residuals': all_quantized_residuals,
             'mapped_indices': all_mapped_indices,
             'sample_representatives': all_sample_reps,
-            'reconstructed_samples': all_reconstructed,
+            'reconstructed_samples': output_reconstructed,
             'compressed_size': compressed_size,
             'original_size': Z * Y * X * self.dynamic_range,
             'compression_ratio': (Z * Y * X * self.dynamic_range) / max(compressed_size, 1)
@@ -612,6 +630,7 @@ class CCSDS123Compressor(nn.Module):
         )
 
         # Set encoding order in header
+        encoding_order = self.compression_params.get('encoding_order', 'BSQ')
         if encoding_order == 'BI':
             header.image_metadata.sample_encoding_order = EncodingOrder.BAND_INTERLEAVED
         else:
@@ -668,10 +687,13 @@ class CCSDS123Compressor(nn.Module):
             'compression_params': self.compression_params.copy(),
             'predictor_type': type(self.predictor).__name__,
             'quantizer_type': type(self.quantizer).__name__,
-            'entropy_coder_final_state': {
-                'high_res_accumulators': self.entropy_coder.high_res_accumulators.clone(),
-                'counters': self.entropy_coder.counters.clone()
-            },
+            'entropy_coder_final_state': (
+                # Only include if entropy_coder is an object with state (not just encode_image function)
+                {
+                    'high_res_accumulators': self.entropy_coder.high_res_accumulators.clone(),
+                    'counters': self.entropy_coder.counters.clone()
+                } if hasattr(self.entropy_coder, 'high_res_accumulators') else {}
+            ),
             'header': header,  # Include CCSDS header for proper decompression
             'header_size': len(header_bytes),  # Size of header for bitstream parsing
             'body_size': len(compressed_body_bits) // 8 if compressed_body_bits else 0,  # Size of compressed body in bytes
@@ -711,7 +733,7 @@ class CCSDS123Compressor(nn.Module):
         # Use encoding order optimizer
         analysis = EncodingOrderOptimizer.analyze_image_structure(image)
 
-        from .encoding_orders import EncodingOrder
+        from ..io import EncodingOrder
         if analysis['recommended_order'] == EncodingOrder.BAND_INTERLEAVED:
             return 'BI'
         else:
@@ -730,7 +752,7 @@ class CCSDS123Compressor(nn.Module):
         # Validate input
         image = self._validate_input(image)
 
-        from .encoding_orders import EncodingOrder
+        from ..io import EncodingOrder
         comparison = EncodingOrderOptimizer.estimate_compression_benefit(
             image,
             EncodingOrder.BAND_INTERLEAVED,
@@ -839,10 +861,10 @@ def decompress(compressed_data: Dict[str, Any]) -> torch.Tensor:
     and applying the sample representatives to get the final reconstructed image.
 
     Mathematical Process:
-    1. Entropy decode bitstream to recover mapped quantizer indices δ_z(t)
+    1. Entropy decode bitstream to recover mapped quantizer indices delta_z(t)
     2. Inverse map to get quantizer indices q_z(t)
-    3. Reconstruct residuals: ε̂_z(t) = q_z(t) * (2*m_z(t) + 1)
-    4. Reconstruct samples: ŝ_z(t) = prediction + ε̂_z(t)
+    3. Reconstruct residuals: epsilon_hat_z(t) = q_z(t) * (2*m_z(t) + 1)
+    4. Reconstruct samples: s_hat_z(t) = prediction + epsilon_hat_z(t)
     5. Apply clamping to valid dynamic range
 
     Args:
@@ -854,28 +876,168 @@ def decompress(compressed_data: Dict[str, Any]) -> torch.Tensor:
     Returns:
         Reconstructed image tensor [Z, Y, X]
     """
+    # Import entropy decoders
+    from ..entropy import BitstreamFormatter
+    from ..entropy.hybrid_coder import HybridEntropyDecoder
+    from ..entropy.rice_coder import CCSDS121BlockAdaptiveEntropyCoder
+
+    # For backwards compatibility, check for direct reconstructed_samples first
+    if 'reconstructed_samples' in compressed_data and 'compression_metadata' not in compressed_data:
+        return compressed_data['reconstructed_samples'].clone()
+
+    # Check for intermediate data (legacy format)
+    if 'intermediate_data' in compressed_data:
+        intermediate = compressed_data['intermediate_data']
+        return intermediate['reconstructed_samples'].clone()
+
+    # Full entropy decoding path - requires compression_metadata
+    if 'compression_metadata' not in compressed_data:
+        raise ValueError(
+            "compressed_data must contain either 'reconstructed_samples', "
+            "'intermediate_data', or 'compression_metadata' with 'compressed_bitstream'"
+        )
+
     # Extract metadata
     metadata = compressed_data['compression_metadata']
+    compression_params = metadata['compression_params']
 
-    # Create decompressor with same parameters
+    # Extract bitstream components
+    compressed_bitstream = compressed_data['compressed_bitstream']
+    header_size = metadata.get('header_size', 0)
+    output_word_size = metadata.get('output_word_size', 8)
+
+    # Parse image shape
+    image_shape = metadata['image_shape']
+    if len(image_shape) == 4:
+        _, Z, Y, X = image_shape
+    else:
+        Z, Y, X = image_shape
+
+    # Extract header and body from bitstream
+    formatter = BitstreamFormatter(output_word_size)
+    header_bytes, body_bytes = formatter.extract_header_and_body(compressed_bitstream, header_size)
+
+    # Decode mapped indices using the appropriate entropy decoder
+    entropy_coder_type = compression_params.get('entropy_coder_type', 'hybrid')
+
+    if entropy_coder_type == 'hybrid':
+        # Use forward-order hybrid decoder matching HybridEntropyCoder
+        decoder = HybridEntropyDecoder(
+            num_bands=Z,
+            rescale_interval=compression_params.get('rescale_interval', 64)
+        )
+        mapped_indices = decoder.decode_image(body_bytes, (Z, Y, X))
+
+    elif entropy_coder_type == 'rice' or entropy_coder_type == 'block_adaptive':
+        # Use CCSDS-121 Rice/block-adaptive decoder
+        block_size = compression_params.get('block_size', compression_params.get('rice_block_size', (16, 16)))
+        rice_decoder = CCSDS121BlockAdaptiveEntropyCoder(
+            num_bands=Z,
+            block_size=block_size
+        )
+        mapped_indices = rice_decoder.decode_image(body_bytes, (Z, Y, X))
+
+    else:
+        raise ValueError(f"Unknown entropy coder type: {entropy_coder_type}")
+
+    # Create decompressor with same parameters for prediction/quantization
     decompressor = CCSDS123Compressor(
         num_bands=metadata['num_bands'],
         dynamic_range=metadata['dynamic_range'],
         lossless=metadata['lossless']
     )
+    decompressor.set_compression_parameters(**compression_params)
 
-    # Set compression parameters
-    decompressor.set_compression_parameters(**metadata['compression_params'])
+    # Reconstruct image sample by sample
+    # We need to iterate in the same order as compression and apply inverse operations
+    reconstructed = torch.zeros(Z, Y, X, dtype=torch.float32)
+    sample_representatives = torch.zeros(Z, Y, X, dtype=torch.float32)
 
-    # For demonstration, we'll use the intermediate data if available
-    # In a full implementation, this would decode the bitstream
-    if 'intermediate_data' in compressed_data:
-        intermediate = compressed_data['intermediate_data']
-        return intermediate['reconstructed_samples'].clone()
+    # Determine encoding order
+    encoding_order = compression_params.get('encoding_order', 'BSQ')
 
-    # Placeholder for full entropy decoder implementation
-    raise NotImplementedError("Full entropy decoding not implemented in this version. "
-                            "Use intermediate_data from compression results for reconstruction.")
+    # Get value range for clamping
+    dynamic_range = metadata['dynamic_range']
+    min_val = 0
+    max_val = 2 ** dynamic_range - 1
+
+    # Iterate in the same order as compression
+    if encoding_order == 'BI':
+        sample_order = _get_bi_sample_order(Z, Y, X)
+    else:
+        sample_order = _get_bsq_sample_order(Z, Y, X)
+
+    for z, y, x in sample_order:
+        # Get the mapped index for this sample
+        mapped_idx = mapped_indices[z, y, x].item()
+
+        # Inverse map to get quantizer index
+        quantizer_idx = decompressor.quantizer.unmap_quantizer_indices(
+            torch.tensor([[mapped_idx]])
+        ).squeeze().item()
+
+        # Predict the current sample using already-reconstructed sample representatives
+        # During decompression, we use sample_representatives as both the "image" and the sample reps
+        prediction = decompressor.predictor.predict_sample(
+            sample_representatives,  # Use reconstructed values as the "image"
+            sample_representatives,
+            z, y, x
+        )
+
+        # Compute quantized residual
+        if metadata['lossless']:
+            # In lossless mode, quantizer index is the residual
+            quantized_residual = float(quantizer_idx)
+        else:
+            # In lossy mode, reconstruct residual from quantizer index
+            # residual = q_z(t) * (2 * m_z(t) + 1) where m_z(t) is max error
+            max_error = decompressor.quantizer.compute_max_error(
+                prediction.unsqueeze(0).unsqueeze(0), z
+            ).squeeze().item()
+            quantized_residual = quantizer_idx * (2 * max_error + 1)
+
+        # Reconstruct sample
+        recon_sample = prediction + quantized_residual
+
+        # Clamp to valid range
+        recon_sample = torch.clamp(recon_sample, min_val, max_val)
+        reconstructed[z, y, x] = recon_sample
+
+        # Update sample representative for future predictions
+        if metadata['lossless']:
+            sample_representatives[z, y, x] = recon_sample
+        else:
+            # Compute proper sample representative for lossy mode
+            max_error_single = decompressor.quantizer.compute_max_error(
+                prediction.unsqueeze(0).unsqueeze(0), z
+            ).squeeze()
+
+            bin_center = decompressor.sample_rep_calc.compute_quantizer_bin_center(
+                recon_sample, prediction, max_error_single
+            )
+
+            sample_rep = decompressor.sample_rep_calc.compute_sample_representative(
+                bin_center, prediction, z, max_error_single
+            )
+            sample_representatives[z, y, x] = sample_rep
+
+    return reconstructed
+
+
+def _get_bi_sample_order(Z: int, Y: int, X: int):
+    """Generate Band-Interleaved sample order"""
+    for y in range(Y):
+        for x in range(X):
+            for z in range(Z):
+                yield z, y, x
+
+
+def _get_bsq_sample_order(Z: int, Y: int, X: int):
+    """Generate Band-Sequential sample order"""
+    for z in range(Z):
+        for y in range(Y):
+            for x in range(X):
+                yield z, y, x
 
 
 def create_block_adaptive_lossless_compressor(num_bands: int, block_size: Tuple[int, int] = (8, 8), **kwargs: Any) -> CCSDS123Compressor:

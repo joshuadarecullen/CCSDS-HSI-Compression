@@ -2,8 +2,8 @@ import torch
 import numpy as np
 import time
 from typing import List, Dict, Any, Tuple, Union
-from ..ccsds.low_entropy_tables import LOW_ENTROPY_TABLES, CompleteLowEntropyCode
-from ..ccsds.rice_coder import RiceCoder
+from ..entropy.low_entropy_tables import LOW_ENTROPY_TABLES, CompleteLowEntropyCode
+from ..entropy.rice_coder import RiceCoder
 
 
 class OptimizedHybridEntropyCoder:

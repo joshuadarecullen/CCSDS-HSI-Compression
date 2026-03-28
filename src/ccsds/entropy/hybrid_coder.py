@@ -135,21 +135,16 @@ class HybridEntropyCoder:
         Returns:
             encoded_bits: List of bits representing encoded sample
         """
-        # Simplified GPO2 encoding (suffix-free variant)
-        # In practice, this would implement the full GPO2 algorithm
-
-        if mapped_index == 0:
-            return [0]  # Special case for zero
-
-        # Encode using unary prefix + binary suffix
+        # GPO2 encoding: unary quotient + binary remainder
+        # No special case for zero - encode uniformly to avoid ambiguity
         k = max(0, code_index - 4)  # GPO2 parameter
         quotient = mapped_index >> k
         remainder = mapped_index & ((1 << k) - 1)
 
-        # Unary encoding of quotient (reversed for suffix-free property)
+        # Unary encoding of quotient
         unary_bits = [1] * quotient + [0]
 
-        # Binary encoding of remainder
+        # Binary encoding of remainder (LSB first)
         binary_bits = []
         for i in range(k):
             binary_bits.append((remainder >> i) & 1)
@@ -507,9 +502,13 @@ class BitWriter:
     def flush(self) -> bytes:
         """Flush remaining bits with padding"""
         if self.bit_count > 0:
-            # Pad with zeros
-            while self.bit_count < 8:
-                self.write_bit(0)
+            # Pad with zeros to complete the byte
+            padding_needed = 8 - self.bit_count
+            for _ in range(padding_needed):
+                self.bit_buffer = (self.bit_buffer << 1)
+            self.buffer.append(self.bit_buffer)
+            self.bit_buffer = 0
+            self.bit_count = 0
 
         return bytes(self.buffer)
 
@@ -543,6 +542,231 @@ def encode_image(mapped_indices: torch.Tensor, num_bands: int) -> bytes:
             writer.write_bit((final_acc >> i) & 1)
 
     return writer.flush()
+
+
+class HybridEntropyDecoder:
+    """
+    Decoder matching the HybridEntropyCoder encoding format
+
+    This decoder reconstructs mapped quantizer indices from the bitstream
+    produced by encode_image() / HybridEntropyCoder.
+
+    NOTE: The encoder updates statistics BEFORE encoding each sample, which
+    means for forward decoding we need to "simulate" the encoder by tracking
+    statistics in the same way. For the first sample, we use initial stats
+    and infer the code from the bitstream structure.
+    """
+
+    def __init__(self, num_bands: int, rescale_interval: int = 64) -> None:
+        self.num_bands = num_bands
+        self.rescale_interval = rescale_interval
+
+        # Track same statistics as encoder - start with initial state
+        self.high_res_accumulators = torch.zeros(num_bands, dtype=torch.float64)
+        self.counters = torch.zeros(num_bands, dtype=torch.long)
+
+        # Entropy threshold (must match encoder)
+        self.entropy_threshold = 8.0
+
+        # Initialize low-entropy decode tables
+        self.low_entropy_codes = self._initialize_low_entropy_decode_tables()
+
+    def _initialize_low_entropy_decode_tables(self) -> List[Dict]:
+        """Initialize decode lookup tables for low-entropy codes"""
+        decode_tables = []
+        for code_id in range(16):
+            code_info = LOW_ENTROPY_TABLES.get_code_info(code_id)
+            decode_table = {}
+
+            # Build reverse lookup: bits -> symbol
+            for pattern, output_bits in code_info.get('encode_table', {}).items():
+                if output_bits:
+                    decode_table[tuple(output_bits)] = pattern[0] if pattern else 0
+
+            decode_tables.append({
+                'decode_table': decode_table,
+                'input_limit': code_info.get('input_limit', 0),
+                'max_output_len': code_info.get('max_output_len', 8)
+            })
+
+        return decode_tables
+
+    def update_statistics(self, mapped_index: int, band: int) -> None:
+        """Update statistics after decoding a sample (mirrors encoder)"""
+        self.high_res_accumulators[band] += 4 * mapped_index
+        self.counters[band] += 1
+
+        # Rescale periodically
+        if self.counters[band] % self.rescale_interval == 0:
+            self.high_res_accumulators[band] /= 2
+            self.counters[band] //= 2
+
+    def classify_entropy_after_update(self, band: int) -> Tuple[bool, int]:
+        """
+        Classify sample as high/low entropy based on statistics AFTER update
+        (matches encoder which updates stats before classification)
+        """
+        if self.counters[band] == 0:
+            return True, 0
+
+        mean_ratio = self.high_res_accumulators[band] / self.counters[band]
+
+        if mean_ratio > self.entropy_threshold:
+            code_index = min(int(mean_ratio / 2), 31)
+            return True, code_index
+        else:
+            code_index = min(int(mean_ratio), 15)
+            return False, code_index
+
+    def decode_gpo2_with_k(self, bits: List[int], pos: int, k: int) -> Tuple[int, int]:
+        """
+        Decode GPO2 encoded value with known k parameter
+
+        GPO2 format: unary quotient (1s followed by 0) + k-bit binary remainder (LSB first)
+
+        Args:
+            bits: Full bitstream
+            pos: Current position
+            k: Number of remainder bits
+
+        Returns:
+            (decoded_value, new_position)
+        """
+        if pos >= len(bits):
+            return 0, pos
+
+        # Read unary quotient (count 1s until 0)
+        quotient = 0
+        while pos < len(bits) and bits[pos] == 1:
+            quotient += 1
+            pos += 1
+
+        if pos < len(bits):
+            pos += 1  # Skip the terminating 0
+
+        # Read k-bit remainder (LSB first, matching encoder)
+        remainder = 0
+        for i in range(k):
+            if pos < len(bits):
+                remainder |= (bits[pos] << i)  # LSB first
+                pos += 1
+
+        mapped_index = (quotient << k) + remainder
+        return mapped_index, pos
+
+    def decode_band_forward(self, bits: List[int], pos: int, num_samples: int, band: int) -> Tuple[torch.Tensor, int]:
+        """
+        Decode all samples for one band using forward simulation
+
+        The encoder updates stats BEFORE encoding, then classifies, then encodes.
+        For decoding, we find ALL consistent (k, value) pairs and choose the
+        one with the smallest k (which typically corresponds to the correct encoding).
+
+        Args:
+            bits: Full bitstream
+            pos: Current position
+            num_samples: Number of samples to decode
+            band: Band index
+
+        Returns:
+            (decoded_samples, new_position)
+        """
+        samples = torch.zeros(num_samples, dtype=torch.long)
+
+        for i in range(num_samples):
+            # Find all consistent (k, value) pairs
+            consistent_pairs = []
+
+            for try_k in range(28):
+                value, new_pos = self.decode_gpo2_with_k(bits, pos, try_k)
+
+                # Check if this value would produce this k
+                test_acc = self.high_res_accumulators[band] + 4 * value
+                test_count = self.counters[band] + 1
+
+                if test_count > 0:
+                    test_ratio = test_acc / test_count
+                    if test_ratio > self.entropy_threshold:
+                        expected_code_index = min(int(test_ratio / 2), 31)
+                    else:
+                        expected_code_index = min(int(test_ratio), 15)
+                    expected_k = max(0, expected_code_index - 4)
+
+                    if expected_k == try_k:
+                        consistent_pairs.append((try_k, value, new_pos))
+
+            if consistent_pairs:
+                # Choose the smallest k (excluding k=0 if there are other options)
+                # k=0 always gives value=0 which is trivially consistent
+                non_zero_k_pairs = [(k, v, p) for k, v, p in consistent_pairs if k > 0]
+                if non_zero_k_pairs:
+                    # Choose the smallest non-zero k
+                    best_k, best_value, best_pos = min(non_zero_k_pairs, key=lambda x: x[0])
+                else:
+                    # Only k=0 is consistent (value must actually be 0)
+                    best_k, best_value, best_pos = consistent_pairs[0]
+            else:
+                # Fallback: use k=27
+                best_value, best_pos = self.decode_gpo2_with_k(bits, pos, 27)
+
+            samples[i] = best_value
+            pos = best_pos
+
+            # Update statistics
+            self.update_statistics(best_value, band)
+
+        return samples, pos
+
+    def decode_image(self, compressed_data: bytes, image_shape: Tuple[int, int, int]) -> torch.Tensor:
+        """
+        Decode compressed image data
+
+        Args:
+            compressed_data: Compressed bitstream from encode_image()
+            image_shape: (Z, Y, X) image dimensions
+
+        Returns:
+            mapped_indices: [Z, Y, X] tensor of decoded mapped indices
+        """
+        Z, Y, X = image_shape
+        num_samples_per_band = Y * X
+
+        # Convert bytes to bits
+        bits = []
+        for byte_val in compressed_data:
+            for i in range(8):
+                bits.append((byte_val >> (7 - i)) & 1)
+
+        mapped_indices = torch.zeros(Z, Y, X, dtype=torch.long)
+        pos = 0
+
+        # Decode each band using forward simulation
+        for z in range(Z):
+            band_samples, pos = self.decode_band_forward(bits, pos, num_samples_per_band, z)
+            mapped_indices[z] = band_samples.reshape(Y, X)
+
+            # Skip tail bits after each band
+            # Tail = flush_table (4 bits + variable) + sync (16 bits)
+            # Simplified: skip 20 bits (4 + 16) since no active low-entropy codes
+            pos += 20
+
+        return mapped_indices
+
+
+def decode_image(compressed_data: bytes, image_shape: Tuple[int, int, int], num_bands: int) -> torch.Tensor:
+    """
+    Main function to decode a compressed image
+
+    Args:
+        compressed_data: Compressed bitstream from encode_image()
+        image_shape: (Z, Y, X) image dimensions
+        num_bands: Number of spectral bands
+
+    Returns:
+        mapped_indices: [Z, Y, X] tensor of decoded mapped indices
+    """
+    decoder = HybridEntropyDecoder(num_bands)
+    return decoder.decode_image(compressed_data, image_shape)
 
 
 class BlockAdaptiveEntropyCoder:

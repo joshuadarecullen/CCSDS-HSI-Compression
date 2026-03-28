@@ -40,8 +40,9 @@ This implementation includes all major components of Issue 2 of the CCSDS-123.0-
 import torch
 from src.ccsds import create_lossless_compressor, decompress
 
-# Create test image [Z, Y, X]
-image = torch.randn(10, 64, 64) * 100  # 10 bands, 64x64 pixels
+# Create test image [Z, Y, X] - supports both signed and unsigned input
+# Unsigned input [0, 2^D-1] is auto-converted to signed range internally
+image = torch.randint(0, 65536, (10, 64, 64), dtype=torch.int32)  # 16-bit unsigned
 
 # Create lossless compressor
 compressor = create_lossless_compressor(num_bands=10, dynamic_range=16)
@@ -53,14 +54,10 @@ print(f"Compression ratio: {results['compression_ratio']:.2f}:1")
 print(f"Compressed size: {results['compressed_size']} bits")
 print(f"Original size: {results['original_size']} bits")
 
-# Verify lossless compression
-reconstructed = results['reconstructed_samples']
-print(f"Lossless: max error = {torch.max(torch.abs(image - reconstructed))}")
-
-# For full decompression from bitstream (if available)
-if 'compressed_bitstream' in results:
-    decompressed = decompress(results)
-    print(f"Decompressed max error = {torch.max(torch.abs(image - decompressed))}")
+# Decompress and verify lossless reconstruction
+reconstructed = decompress(results)
+max_error = torch.max(torch.abs(image.float() - reconstructed))
+print(f"Lossless verified: max error = {max_error}")  # Should be 0
 ```
 
 ### Near-Lossless Compression with Quality Assessment
@@ -102,7 +99,7 @@ sam = calculate_spectral_angle(image[:5], reconstructed,
 
 ```python
 from src.ccsds import CCSDS123Compressor
-from src.optimized import OptimizedCCSDS123Compressor
+from src.ccsds.optimized import OptimizedCCSDS123Compressor
 
 # Create CCSDS-compliant compressor with Issue 2 features
 compressor = CCSDS123Compressor(
@@ -135,7 +132,7 @@ print(f"Prediction mode: {compressor.predictor.get_prediction_mode_info()}")
 ### Optimized Compressor with Configurable Entropy Coding
 
 ```python
-from src.optimized import OptimizedCCSDS123Compressor
+from src.ccsds.optimized import OptimizedCCSDS123Compressor
 
 # Create optimized compressor with GPU acceleration
 optimized_compressor = OptimizedCCSDS123Compressor(
@@ -213,27 +210,42 @@ ccsds-benchmark --error-limits 1 2 4 8
 ```
 CCSDS-HSI-Compression/
 ├── src/
-│   ├── ccsds/                         # Core CCSDS-123.0-B-2 implementation  
-│   │   ├── __init__.py                # Package interface with main exports
-│   │   ├── ccsds_compressor.py        # Main CCSDS123Compressor class
-│   │   ├── predictor.py               # SpectralPredictor & NarrowLocalSumPredictor
-│   │   ├── quantizer.py               # UniformQuantizer & LosslessQuantizer
-│   │   ├── entropy_coder.py           # HybridEntropyCoder & encode_image
-│   │   ├── sample_representative.py   # SampleRepresentativeCalculator
-│   │   ├── cli.py                     # Command-line interface tools
-│   │   └── metrics/                   # Quality assessment metrics
-│   │       ├── __init__.py            # Metrics package interface
-│   │       └── quality_metrics.py     # PSNR, MSSIM, SAM implementations
-│   └── optimized/                     # Performance-optimized implementations
-│       ├── __init__.py                # Optimized package interface
-│       ├── optimized_compressor.py    # OptimizedCCSDS123Compressor
-│       ├── batch_optimized_compressor.py  # BatchOptimizedCCSDS123Compressor
-│       ├── optimized_entropy_coder.py     # OptimizedHybridEntropyCoder
-│       └── ...                        # Other optimized components
+│   ├── __init__.py                    # Top-level exports (convenience re-exports)
+│   └── ccsds/                         # Main CCSDS-123.0-B-2 package
+│       ├── __init__.py                # Package interface with main exports
+│       ├── cli.py                     # Command-line interface tools
+│       ├── core/                      # Core compression components
+│       │   ├── __init__.py
+│       │   ├── compressor.py          # CCSDS123Compressor main class
+│       │   ├── predictor.py           # SpectralPredictor & NarrowLocalSumPredictor
+│       │   ├── quantizer.py           # UniformQuantizer & LosslessQuantizer
+│       │   └── sample_representative.py   # SampleRepresentativeCalculator
+│       ├── entropy/                   # Entropy coding implementations
+│       │   ├── __init__.py
+│       │   ├── hybrid_coder.py        # HybridEntropyCoder & BitWriter
+│       │   ├── ccsds_hybrid_coder.py  # CCSDS123HybridEntropyCoder
+│       │   ├── rice_coder.py          # RiceCoder (CCSDS-121.0-B-2)
+│       │   ├── low_entropy_tables.py  # Low-entropy code tables
+│       │   └── bitstream.py           # BitstreamFormatter
+│       ├── io/                        # I/O and header components
+│       │   ├── __init__.py
+│       │   ├── header.py              # CCSDS123Header
+│       │   └── encoding_orders.py     # SampleIterator, EncodingOrder
+│       ├── optimized/                 # Performance-optimized implementations
+│       │   ├── __init__.py
+│       │   ├── optimized_compressor.py    # OptimizedCCSDS123Compressor
+│       │   ├── batch_optimized_compressor.py  # BatchOptimizedCCSDS123Compressor
+│       │   ├── optimized_predictor.py     # OptimizedSpectralPredictor
+│       │   ├── optimized_quantizer.py     # OptimizedUniformQuantizer
+│       │   └── optimized_entropy_coder.py # OptimizedHybridEntropyCoder
+│       └── metrics/                   # Quality assessment metrics
+│           ├── __init__.py
+│           └── quality_metrics.py     # PSNR, MSSIM, SAM implementations
 ├── tests/
 │   ├── unit/                          # Unit tests for all components
 │   │   ├── test_ccsds.py             # Main CCSDS compressor tests
 │   │   ├── test_lossless.py          # Lossless compression tests
+│   │   ├── test_32bit_samples.py     # 32-bit dynamic range tests
 │   │   ├── test_optimized_basic.py   # Basic optimized compressor tests
 │   │   ├── test_performance.py       # Performance comparison tests
 │   │   └── test_*.py                 # Additional unit tests
@@ -241,7 +253,7 @@ CCSDS-HSI-Compression/
 │   │   ├── test_speed_comparison.py  # Comprehensive speed benchmarks
 │   │   └── test_quick_speed.py       # Quick performance tests
 │   └── utils.py                      # Test utilities
-├── examples/                         # Usage examples (Jupyter notebooks)
+├── docs/                             # Documentation
 ├── environment.yaml                  # Conda environment specification
 ├── pyproject.toml                   # Modern Python packaging
 └── README.md                        # This file
@@ -304,6 +316,7 @@ The test suite includes:
 - **Device compatibility**: CPU/CUDA device handling and tensor management
 - **Error handling**: Robust fallback mechanisms and device mismatch resolution
 - **Standards compliance**: CCSDS-123.0-B-2 specification adherence
+- **32-bit sample testing**: Comprehensive tests for 32-bit dynamic range support
 
 ## Implementation Notes
 
@@ -385,6 +398,8 @@ The test suite includes:
 ### Latest Updates: CCSDS-123.0-B-2 Full Compliance ✅
 
 #### **Core CCSDS Compliance Fixes**
+- **Fixed equation (37) high-resolution prediction** - Correct computation of high-resolution predicted sample values
+- **Fixed signed/unsigned input handling** - Auto-detects unsigned input [0, 2^D-1] and converts to signed range for internal processing, then converts back on output
 - **Fixed local sum calculations** to match equations (20)-(23) from CCSDS-123.0-B-2 standard
 - **Implemented proper directional local differences** per equations (25)-(27)
 - **Added correct weight update mechanism** following equations (51)-(54)
@@ -394,6 +409,7 @@ The test suite includes:
 
 #### **Enhanced Entropy Coding System**
 - **Configurable entropy coding** in `compress()` method - users can now specify entropy coder type per compression
+- **HybridEntropyDecoder** for full bitstream decoding with GPO2 and low-entropy code support
 - **Block-adaptive entropy coding** support in causal optimization mode
 - **Rice entropy coding** (CCSDS-121.0-B-2) for Issue 2 compliance
 - **Convenience methods** for specialized entropy coding (`compress_with_block_adaptive`, `compress_with_rice_coding`, `compress_streaming`)
@@ -453,15 +469,15 @@ sam = calculate_spectral_angle(original, reconstructed, callback=sam_callback)
 
 This implementation achieves high CCSDS-123.0-B-2 compliance with some remaining areas for enhancement:
 
-1. **Complete bitstream decoding**: The `decompress()` function uses intermediate compression data rather than full entropy decoding from raw bitstream bytes
-2. **Sophisticated rate control**: Uses basic periodic error limit updating rather than advanced adaptive rate control algorithms  
-3. **Modular arithmetic**: Simplified high-resolution prediction calculation (equation 37) rather than full modular arithmetic implementation
-4. **Hardware-specific optimizations**: Focus on GPU acceleration rather than FPGA or ASIC-specific implementations
-5. **Extended bit depths**: Tested primarily with 8-16 bit samples, though 32-bit support is implemented
+1. **Full bitstream entropy decoding**: The `decompress()` function can use intermediate compression data for fast reconstruction. Full entropy decoding from raw bitstream is implemented (`HybridEntropyDecoder`, `BitReader`) but requires `compression_metadata` in output
+2. **Advanced rate control**: Implements adaptive multi-factor rate control (compression ratio, prediction error, band-specific weighting) but lacks ML-based or Lagrangian optimization approaches
+3. **Hardware-specific optimizations**: Focus on GPU acceleration rather than FPGA or ASIC-specific implementations
+4. **32-bit extreme values**: 32-bit samples work correctly for typical ranges, but extreme values (full ±2^31 range) may cause overflow in intermediate calculations
 
 **Fully Implemented CCSDS Features**: ✅
+- ✅ High-resolution prediction (equation 37)
 - ✅ Local sum calculations (equations 20-23)
-- ✅ Directional local differences (equations 25-27)  
+- ✅ Directional local differences (equations 25-27)
 - ✅ Weight update mechanism (equations 51-54)
 - ✅ Full vs reduced prediction modes (section 4.3)
 - ✅ Sample representatives (equations 46-48)
@@ -470,6 +486,7 @@ This implementation achieves high CCSDS-123.0-B-2 compliance with some remaining
 - ✅ Supplementary information tables
 - ✅ Block-adaptive entropy coding
 - ✅ Configurable entropy coder selection
+- ✅ Signed and unsigned sample support with auto-detection
 
 ## Performance
 

@@ -12,9 +12,12 @@ from pathlib import Path
 # Add parent directory to path for imports
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-from src.ccsds.predictor import SpectralPredictor
-from src.ccsds.quantizer import LosslessQuantizer, UniformQuantizer
-from src.ccsds.sample_representative import SampleRepresentativeCalculator
+from src.ccsds import (
+    SpectralPredictor,
+    LosslessQuantizer,
+    UniformQuantizer,
+    SampleRepresentativeCalculator
+)
 
 
 def test_predictor():

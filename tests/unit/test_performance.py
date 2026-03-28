@@ -18,7 +18,7 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
 from src.ccsds import create_lossless_compressor
-from src.optimized import create_optimized_lossless_compressor
+from src import create_optimized_lossless_compressor
 from tests.utils import generate_test_image
 
 

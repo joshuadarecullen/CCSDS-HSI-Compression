@@ -25,10 +25,10 @@ except ImportError:
     ORIGINAL_AVAILABLE = False
     print("Warning: Original CCSDS compressor not available")
 
-from src.optimized import create_optimized_lossless_compressor
+from src import create_optimized_lossless_compressor
 
 try:
-    from src.optimized import BatchOptimizedCCSDS123Compressor
+    from src import BatchOptimizedCCSDS123Compressor
     BATCH_AVAILABLE = True
 except ImportError:
     BATCH_AVAILABLE = False
