@@ -1,5 +1,5 @@
 """
-Numba port of `Ccsds123._run` — byte-identical to the pure-Python reference
+Numba port of `Ccsds123._run`, byte-identical to the pure-Python reference
 (verified in the tests), ~100-200x faster. Selected automatically when numba is
 installed and the config is int64-safe, otherwise the pure-Python path runs.
 

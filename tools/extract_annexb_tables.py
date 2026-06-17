@@ -9,7 +9,7 @@ region = LINES[START:END]
 
 NOISE = ("CCSDS 123.0-B-2", "RECOMMENDED STANDARD", "LOSSLESS", "Page B-",
          "Input Codeword", "Output Codeword", "Active Prefix", "Flush Word", "Cor. 3",
-         "February")   # NB: do NOT filter bare "2021"/"2019" — they are real codewords
+         "February")   # NB: do NOT filter bare "2021"/"2019", they are real codewords
 OUT_RE = re.compile(r"<?\d+'h(?:\([0-9A-Fr+ ]*\)|[0-9A-F]+)>?")
 SYM = {**{str(d): d for d in range(10)}, "A": 10, "B": 11, "C": 12, "X": "X"}
 

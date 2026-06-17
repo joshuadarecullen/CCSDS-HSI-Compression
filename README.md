@@ -4,7 +4,7 @@ A pure-integer implementation of the CCSDS-123.0-B-2 standard for lossless and
 near-lossless multispectral / hyperspectral image compression.
 
 The encoder and decoder share a single prediction loop, so `compress -> decompress`
-is bit-exact by construction — lossless really means lossless, verified through the
+is bit-exact by construction. Lossless really means lossless, verified through the
 actual entropy-coded bitstream rather than by stashing the reconstruction. The core
 is numpy-only; with [numba](https://numba.pydata.org/) installed a JIT fast path
 runs automatically (byte-identical to the reference, ~100-200x faster).
@@ -32,7 +32,7 @@ recon = codec.decompress(codec.compress(img))
 assert np.abs(img - recon).max() <= 4
 ```
 
-Quality metrics for near-lossless reconstructions (numpy-only — PSNR, MSSIM, SAM):
+Quality metrics for near-lossless reconstructions (numpy-only: PSNR, MSSIM, SAM):
 
 ```python
 from src.ccsds import quality_report
@@ -40,7 +40,7 @@ print(quality_report(img, recon, dynamic_range=16))
 # {'psnr_db': ..., 'mssim': ..., 'sam_rad': ..., 'max_abs_error': ...}
 ```
 
-Decode a blob without holding a configured codec — the parameters come from the
+Decode a blob without holding a configured codec; the parameters come from the
 header:
 
 ```python
@@ -70,7 +70,7 @@ updating (needs BI order), and the optional supplementary / weight tables.
 src/ccsds/
   codec.py                 CCSDS123 high-level wrapper (numpy or torch)
   metrics.py               PSNR / MSSIM / SAM (numpy-only)
-  core/reference_codec.py  Ccsds123 / CodecParams — the codec
+  core/reference_codec.py  Ccsds123 / CodecParams (the codec)
   core/_codec_numba.py     numba kernel (byte-identical fast path)
   entropy/hybrid.py        hybrid entropy coder (5.4.3.3)
   entropy/_hybrid_numba.py numba hybrid kernels

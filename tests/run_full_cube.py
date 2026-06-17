@@ -1,7 +1,7 @@
 """Headline full-cube run, lossless, through the real bitstream.
 
 Uses real Indian Pines (145x145x220) if the .mat is available locally, otherwise
-a synthetic cube of the same size — so this runs from a fresh clone. With numba
+a synthetic cube of the same size, so this runs from a fresh clone. With numba
 installed it finishes in ~1 s each way; pure-Python takes a couple of minutes.
 """
 import importlib.util
