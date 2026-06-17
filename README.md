@@ -147,7 +147,7 @@ well ahead as the limit grows (it packs the mostly-zero residuals into sub-1-bit
 
 Pushing the limit further drives the rate well under 1 bit per pixel per band. The plot zooms the
 hybrid curves into 0-1 bpppb. Lossless costs 4-8 bpppb on these scenes, so the **0.3-0.4 bpppb**
-target is a 10x or larger cut in rate, and every scene reaches it.
+target is a 10x or larger cut in rate.
 
 ![Low-bitrate rate-distortion](assets/low_rate.png)
 
