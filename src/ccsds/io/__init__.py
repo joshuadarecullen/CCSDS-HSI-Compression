@@ -1,35 +1,5 @@
-"""
-CCSDS-123.0-B-2 I/O Components
+"""CCSDS-123.0-B-2 compressed-image header (section 5.3)."""
 
-This module contains I/O and formatting components:
-- CCSDS123Header: Compressed image header
-- SampleIterator: Sample encoding order iteration
-- EncodingOrderOptimizer: Encoding order optimization
-"""
+from .ccsds_header import pack_header, parse_header
 
-from .header import (
-    CCSDS123Header,
-    PredictorMode,
-    EncodingOrder,
-    SupplementaryTable,
-    TableType,
-    TableDimension
-)
-
-from .encoding_orders import (
-    SampleIterator,
-    EncodingOrderOptimizer,
-    EncodingOrder as SampleEncodingOrder
-)
-
-__all__ = [
-    'CCSDS123Header',
-    'PredictorMode',
-    'EncodingOrder',
-    'SupplementaryTable',
-    'TableType',
-    'TableDimension',
-    'SampleIterator',
-    'EncodingOrderOptimizer',
-    'SampleEncodingOrder'
-]
+__all__ = ["pack_header", "parse_header"]
