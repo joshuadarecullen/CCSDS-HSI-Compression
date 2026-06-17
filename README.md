@@ -143,12 +143,28 @@ well ahead as the limit grows (it packs the mostly-zero residuals into sub-1-bit
 | pavia_centre | 102 | 13 | 1.79:1 | 3.1:1 | 5.0:1 | 10.7:1 |
 | pavia_university | 103 | 13 | 1.77:1 | 3.1:1 | 4.9:1 | 10.2:1 |
 
+### Low bitrate (0.3-0.4 bpppb)
+
+Pushing the limit further drives the rate well under 1 bit per pixel per band. The plot zooms the
+hybrid curves into 0-1 bpppb. Lossless costs 4-8 bpppb on these scenes, so the **0.3-0.4 bpppb**
+target is a 10x or larger cut in rate, and every scene reaches it.
+
+![Low-bitrate rate-distortion](assets/low_rate.png)
+
+The smoother 16-bit scenes stay at 50-60 dB there (washington_dc **56.2 dB at 0.29 bpppb**, 54.6:1;
+botswana 58.2 dB at 0.29 bpppb; ksc 52.7 dB at 0.43 bpppb), while the noisier 10-bit urban scenes
+trade down into the 20s (urban_r162 25 dB at 0.32 bpppb). Salinas holds roughly 51-56 dB across the
+band. This sweep runs the hybrid coder out to an error limit of 512.
+
 Reproduce (reads `<dataset>/zarr/cube.zarr`, needs `zarr`; non-integer/normalised cubes are
 auto-skipped — here `samson` was skipped as normalised and the 752M-sample `chikusei` by size):
 
 ```bash
 python3 examples/benchmark.py --root <data-dir> --out assets/benchmark_local.csv
-python3 examples/plot_benchmark.py --csv assets/benchmark_local.csv --out assets
+python3 examples/benchmark.py --root <data-dir> --coders hybrid \
+    --limits 0 2 4 8 16 32 64 128 256 512 --out assets/benchmark_lowrate.csv
+python3 examples/plot_benchmark.py --csv assets/benchmark_local.csv \
+    --lowrate-csv assets/benchmark_lowrate.csv --out assets
 ```
 
 ## References
