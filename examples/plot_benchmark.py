@@ -61,6 +61,27 @@ def _lines(rows, datasets, xkey, ykey, only_near_lossless, title, xlabel, ylabel
     plt.close(fig)
 
 
+def low_rate(rows, datasets, out):
+    """Rate-distortion zoomed into the 0-1 bpppb low-bitrate region."""
+    fig, ax = plt.subplots(figsize=(7.6, 5.0))
+    for ds, c in zip(datasets, _colors(len(datasets))):
+        pts = [r for r in rows if r["dataset"] == ds and r["entropy"] == "hybrid"
+               and 0 < r["bpppb"] <= 1.05]
+        pts.sort(key=lambda r: r["bpppb"])
+        if pts:
+            ax.plot([p["bpppb"] for p in pts], [p["psnr_db"] for p in pts],
+                    marker="o", ms=4, lw=1.5, color=c, label=pretty(ds))
+    ax.set_xlim(0, 1)
+    ax.set_xlabel("bits per pixel per band (bpppb)")
+    ax.set_ylabel("PSNR (dB)")
+    ax.set_title("Rate-distortion at low bitrate (hybrid coder)")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=7.5, ncol=2)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out, "low_rate.png"), dpi=140)
+    plt.close(fig)
+
+
 def lossless_ratio(rows, datasets, out):
     def loss(d, coder):
         return next((r["ratio"] for r in rows if r["dataset"] == d
@@ -85,11 +106,16 @@ def lossless_ratio(rows, datasets, out):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
+    ap.add_argument("--lowrate-csv", help="extended-limit hybrid sweep -> low_rate.png")
     ap.add_argument("--out", default="assets")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     rows = load(args.csv)
     datasets = datasets_by_ratio(rows)
+    if args.lowrate_csv:
+        lr = load(args.lowrate_csv)
+        low_rate(lr, datasets_by_ratio(lr), args.out)
+        print(f"wrote low_rate.png to {args.out}/")
     _lines(rows, datasets, "bpppb", "psnr_db", True,
            "Rate–distortion (hybrid coder, near-lossless)",
            "bits per pixel per band (bpppb)", "PSNR (dB)", "rate_distortion.png", args.out)
