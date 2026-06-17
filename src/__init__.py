@@ -2,6 +2,9 @@
 
 __version__ = "2.0.0"
 
-from .ccsds import CCSDS123, Ccsds123, CodecParams
+from .ccsds import (
+    CCSDS123, Ccsds123, CodecParams,
+    calculate_psnr, calculate_mssim, calculate_spectral_angle, quality_report)
 
-__all__ = ["CCSDS123", "Ccsds123", "CodecParams"]
+__all__ = ["CCSDS123", "Ccsds123", "CodecParams",
+           "calculate_psnr", "calculate_mssim", "calculate_spectral_angle", "quality_report"]

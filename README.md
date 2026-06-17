@@ -32,6 +32,14 @@ recon = codec.decompress(codec.compress(img))
 assert np.abs(img - recon).max() <= 4
 ```
 
+Quality metrics for near-lossless reconstructions (numpy-only — PSNR, MSSIM, SAM):
+
+```python
+from src.ccsds import quality_report
+print(quality_report(img, recon, dynamic_range=16))
+# {'psnr_db': ..., 'mssim': ..., 'sam_rad': ..., 'max_abs_error': ...}
+```
+
 Decode a blob without holding a configured codec — the parameters come from the
 header:
 
@@ -61,6 +69,7 @@ updating (needs BI order), and the optional supplementary / weight tables.
 ```
 src/ccsds/
   codec.py                 CCSDS123 high-level wrapper (numpy or torch)
+  metrics.py               PSNR / MSSIM / SAM (numpy-only)
   core/reference_codec.py  Ccsds123 / CodecParams — the codec
   core/_codec_numba.py     numba kernel (byte-identical fast path)
   entropy/hybrid.py        hybrid entropy coder (5.4.3.3)

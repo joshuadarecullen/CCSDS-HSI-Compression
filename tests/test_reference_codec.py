@@ -181,6 +181,25 @@ def test_package_imports_without_torch():
     print(f"  package import via src.ccsds.CCSDS123 + round-trip: OK (torch present={has_torch})")
 
 
+def test_metrics():
+    """numpy quality metrics (PSNR/MSSIM/SAM): exact match is the ceiling, error degrades them."""
+    import importlib.util as ilu
+    mspec = ilu.spec_from_file_location("metrics", os.path.join(REPO, "src/ccsds/metrics.py"))
+    m = ilu.module_from_spec(mspec)
+    mspec.loader.exec_module(m)
+    img = cube(12, 32, 32)
+    assert m.calculate_psnr(img, img, 16) == float("inf")
+    assert m.calculate_mssim(img, img) > 0.999999
+    assert m.calculate_spectral_angle(img, img) < 1e-4
+    rng = np.random.default_rng(3)
+    noisy = np.clip(img + rng.integers(-4, 5, img.shape), 0, (1 << 16) - 1)
+    rep = m.quality_report(img, noisy, 16)
+    assert np.isfinite(rep["psnr_db"]) and rep["mssim"] < 1.0
+    assert rep["sam_rad"] > 0 and rep["max_abs_error"] <= 4
+    print(f"  metrics: identical=(inf dB, MSSIM~1, SAM~0); noisy(a<=4) "
+          f"PSNR={rep['psnr_db']:.1f}dB MSSIM={rep['mssim']:.4f} SAM={rep['sam_rad']:.2e}rad")
+
+
 def test_lossless_crop():
     img = cube(24, 32, 32)
     out, st = _roundtrip(img, num_prediction_bands=3, full=True)
@@ -258,7 +277,8 @@ def test_indian_pines_if_present():
 if __name__ == "__main__":
     for fn in (test_map_unmap_roundtrip, test_ccsds_header, test_hybrid_codec,
                test_numba_byte_identical, test_hybrid_numba_identical,
-               test_package_imports_without_torch, test_lossless_crop, test_reduced_mode,
+               test_package_imports_without_torch, test_metrics,
+               test_lossless_crop, test_reduced_mode,
                test_sample_rep_phi, test_narrow_local_sums, test_near_lossless,
                test_band_dependent_error_limits, test_lossless_region,
                test_indian_pines_if_present):
