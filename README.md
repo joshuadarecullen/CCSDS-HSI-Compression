@@ -84,6 +84,7 @@ tests/
   synthetic_hsi.py         deterministic test cube (pure numpy)
   run_full_cube.py         full-size headline run
 tools/extract_annexb_tables.py   regenerate annexb_tables.json from the standard text
+examples/evaluate.py             compress a cube + report ratio / PSNR / MSSIM / SAM
 ```
 
 ## Testing
@@ -100,13 +101,13 @@ pure-Python reference.
 
 ## Evaluating quality
 
-`tools/evaluate.py` compresses a cube at lossless and a sweep of near-lossless error
+`examples/evaluate.py` compresses a cube at lossless and a sweep of near-lossless error
 limits and prints compression ratio with PSNR / MSSIM / SAM:
 
 ```bash
-python3 tools/evaluate.py                                  # Indian Pines if present, else synthetic
-python3 tools/evaluate.py --entropy hybrid --limits 0 8 16 32 64
-python3 tools/evaluate.py --input cube.npy --peak data     # PSNR vs the data's actual peak
+python3 examples/evaluate.py                                  # Indian Pines if present, else synthetic
+python3 examples/evaluate.py --entropy hybrid --limits 0 8 16 32 64
+python3 examples/evaluate.py --input cube.npy --peak data     # PSNR vs the data's actual peak
 ```
 
 On Indian Pines, lossless is ~2.47:1; the hybrid coder reaches ~16:1 at an absolute
