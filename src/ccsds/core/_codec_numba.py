@@ -384,3 +384,201 @@ def run_numba_delta(codec, encode: bool, image=None, delta=None):
     _kernel(0, 2, delta_arr, np.zeros((1, 1, 1), np.int64), np.zeros(1, np.uint8),
             dummy_buf, spp, recon, cdiff, *args)
     return recon
+
+
+# --- band-interleaved sample-adaptive coder (5.4.2.2), byte-identical to _encode_bi ---
+@njit
+def _bi_enc(delta, Nz, Ny, Nx, D, M, n_i, G, resc, sigma_init, umax,
+            periodic, u, au, ru, da, dr, DA, DR, abs_vals, rel_vals, buf):
+    pos = 0
+    sigma = np.empty(Nz, dtype=np.int64)
+    for z in range(Nz):
+        sigma[z] = sigma_init
+    for y in range(Ny):
+        if periodic == 1 and (y % (1 << u)) == 0:
+            pi = y >> u
+            if au == 1:
+                for zz in range(Nz if da == 1 else 1):
+                    v = abs_vals[pi, zz]
+                    for b in range(DA - 1, -1, -1):
+                        if (v >> b) & 1:
+                            buf[pos >> 3] |= (1 << (7 - (pos & 7)))
+                        pos += 1
+            if ru == 1:
+                for zz in range(Nz if dr == 1 else 1):
+                    v = rel_vals[pi, zz]
+                    for b in range(DR - 1, -1, -1):
+                        if (v >> b) & 1:
+                            buf[pos >> 3] |= (1 << (7 - (pos & 7)))
+                        pos += 1
+        for i in range(n_i):
+            z0 = i * M
+            z1 = (i + 1) * M
+            if z1 > Nz:
+                z1 = Nz
+            for x in range(Nx):
+                t = y * Nx + x
+                for z in range(z0, z1):
+                    d = delta[z, y, x]
+                    if t == 0:
+                        for b in range(D - 1, -1, -1):
+                            if (d >> b) & 1:
+                                buf[pos >> 3] |= (1 << (7 - (pos & 7)))
+                            pos += 1
+                    else:
+                        k = _kparam(sigma[z], G[t], D)
+                        uq = d >> k
+                        if uq < umax:
+                            pos += uq
+                            buf[pos >> 3] |= (1 << (7 - (pos & 7)))
+                            pos += 1
+                            for b in range(k - 1, -1, -1):
+                                if (d >> b) & 1:
+                                    buf[pos >> 3] |= (1 << (7 - (pos & 7)))
+                                pos += 1
+                        else:
+                            pos += umax
+                            for b in range(D - 1, -1, -1):
+                                if (d >> b) & 1:
+                                    buf[pos >> 3] |= (1 << (7 - (pos & 7)))
+                                pos += 1
+                        if resc[t] == 0:
+                            sigma[z] += d
+                        else:
+                            sigma[z] = (sigma[z] + d + 1) >> 1
+    return pos
+
+
+@njit
+def _bi_dec(body, Nz, Ny, Nx, D, M, n_i, G, resc, sigma_init, umax,
+            periodic, u, au, ru, da, dr, DA, DR, out, got_abs, got_rel):
+    pos = 0
+    sigma = np.empty(Nz, dtype=np.int64)
+    for z in range(Nz):
+        sigma[z] = sigma_init
+    for y in range(Ny):
+        if periodic == 1 and (y % (1 << u)) == 0:
+            pi = y >> u
+            if au == 1:
+                for zz in range(Nz if da == 1 else 1):
+                    v = 0
+                    for _ in range(DA):
+                        v = (v << 1) | ((body[pos >> 3] >> (7 - (pos & 7))) & 1)
+                        pos += 1
+                    got_abs[pi, zz] = v
+            if ru == 1:
+                for zz in range(Nz if dr == 1 else 1):
+                    v = 0
+                    for _ in range(DR):
+                        v = (v << 1) | ((body[pos >> 3] >> (7 - (pos & 7))) & 1)
+                        pos += 1
+                    got_rel[pi, zz] = v
+        for i in range(n_i):
+            z0 = i * M
+            z1 = (i + 1) * M
+            if z1 > Nz:
+                z1 = Nz
+            for x in range(Nx):
+                t = y * Nx + x
+                for z in range(z0, z1):
+                    if t == 0:
+                        d = 0
+                        for _ in range(D):
+                            d = (d << 1) | ((body[pos >> 3] >> (7 - (pos & 7))) & 1)
+                            pos += 1
+                    else:
+                        k = _kparam(sigma[z], G[t], D)
+                        c = 0
+                        got = 0
+                        d = 0
+                        while c < umax and got == 0:
+                            bit = (body[pos >> 3] >> (7 - (pos & 7))) & 1
+                            pos += 1
+                            if bit == 1:
+                                rem = 0
+                                for _ in range(k):
+                                    rem = (rem << 1) | ((body[pos >> 3] >> (7 - (pos & 7))) & 1)
+                                    pos += 1
+                                d = (c << k) | rem
+                                got = 1
+                            else:
+                                c += 1
+                        if got == 0:
+                            d = 0
+                            for _ in range(D):
+                                d = (d << 1) | ((body[pos >> 3] >> (7 - (pos & 7))) & 1)
+                                pos += 1
+                        if resc[t] == 0:
+                            sigma[z] += d
+                        else:
+                            sigma[z] = (sigma[z] + d + 1) >> 1
+                    out[z, y, x] = d
+    return pos
+
+
+def _bi_setup(codec):
+    p = codec.p
+    Nz, Ny, Nx, D = p.num_bands, p.height, p.width, p.dynamic_range
+    M = p.interleave_depth or Nz
+    G, resc = codec._gamma_seq(Ny * Nx)
+    return (Nz, Ny, Nx, D, M, (Nz + M - 1) // M,
+            np.array(G, np.int64), np.array([1 if r else 0 for r in resc], np.int8),
+            codec._sigma_init(), p.u_max)
+
+
+def _bi_vals(period, dep, Nz, nper):
+    arr = np.zeros((max(nper, 1), Nz), np.int64)
+    for pp in range(nper):
+        e = period[pp]
+        if dep:
+            for z in range(Nz):
+                arr[pp, z] = int(e[z])
+        else:
+            arr[pp, 0] = int(e)
+    return arr
+
+
+def encode_bi_numba(codec, delta, period_abs=None, period_rel=None, u=0):
+    Nz, Ny, Nx, D, M, n_i, G, resc, sinit, umax = _bi_setup(codec)
+    periodic = 1 if period_abs is not None else 0
+    au = ru = da = dr = DA = DR = 0
+    abs_vals = rel_vals = np.zeros((1, Nz), np.int64)
+    lim_bits = 0
+    if periodic:
+        au, ru, da, dr, DA, DR = codec._limit_layout()
+        nper = len(period_abs)
+        abs_vals = _bi_vals(period_abs, da, Nz, nper) if au else abs_vals
+        rel_vals = _bi_vals(period_rel, dr, Nz, nper) if ru else rel_vals
+        lim_bits = nper * ((Nz if da else 1) * DA * au + (Nz if dr else 1) * DR * ru)
+        au, ru, da, dr = int(au), int(ru), int(da), int(dr)
+    cap = (Nz * Ny * Nx * (umax + D) + lim_bits + 64) // 8 + 64
+    buf = np.zeros(cap, np.uint8)
+    nbits = _bi_enc(np.ascontiguousarray(delta, np.int64), Nz, Ny, Nx, D, M, n_i, G, resc,
+                    sinit, umax, periodic, u, au, ru, da, dr, DA, DR, abs_vals, rel_vals, buf)
+    while nbits % 8:
+        nbits += 1
+    return bytes(buf[:nbits // 8])
+
+
+def decode_bi_numba(codec, body):
+    p = codec.p
+    Nz, Ny, Nx, D, M, n_i, G, resc, sinit, umax = _bi_setup(codec)
+    out = np.zeros((Nz, Ny, Nx), np.int64)
+    body_arr = np.frombuffer(body, np.uint8).copy()
+    if not p.periodic:
+        dummy = np.zeros((1, Nz), np.int64)
+        _bi_dec(body_arr, Nz, Ny, Nx, D, M, n_i, G, resc, sinit, umax,
+                0, 0, 0, 0, 0, 0, 0, 0, out, dummy, dummy)
+        return out, None, None, 0
+    u = p.update_period_exp
+    au, ru, da, dr, DA, DR = codec._limit_layout()
+    nper = (Ny + (1 << u) - 1) >> u
+    got_abs = np.zeros((nper, Nz), np.int64)
+    got_rel = np.zeros((nper, Nz), np.int64)
+    _bi_dec(body_arr, Nz, Ny, Nx, D, M, n_i, G, resc, sinit, umax,
+            1, u, int(au), int(ru), int(da), int(dr), int(DA), int(DR), out, got_abs, got_rel)
+    pa = (([[int(got_abs[pp, z]) for z in range(Nz)] for pp in range(nper)] if da
+           else [int(got_abs[pp, 0]) for pp in range(nper)]) if au else [0] * nper)
+    pr = (([[int(got_rel[pp, z]) for z in range(Nz)] for pp in range(nper)] if dr
+           else [int(got_rel[pp, 0]) for pp in range(nper)]) if ru else [0] * nper)
+    return out, pa, pr, u

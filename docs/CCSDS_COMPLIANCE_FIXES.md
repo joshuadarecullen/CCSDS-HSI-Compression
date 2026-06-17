@@ -66,7 +66,8 @@ per-period limits are carried in the body and applied as `period = y >> u`.
   implemented.
 - **Encoding order** (5.4.2): BSQ and band-interleaved (BI: BIP / BIL / intermediate
   sub-frame depth M), the latter with optional periodic error-limit updating
-  (4.8.2.4). The BI sample-adaptive coder is pure-Python (not yet numba-accelerated).
+  (4.8.2.4). The BI sample-adaptive coder has a numba fast path that is
+  byte-identical to the pure-Python reference (~200x faster).
 - **Header**: a bit-exact CCSDS 5.3 header (`io/ccsds_header.py`): Image Metadata
   Essential, Predictor Metadata Primary + Quantization + Sample Representative, and
   the Entropy Coder Metadata. Pack/parse round-trips every parameter; the lossless

@@ -28,11 +28,13 @@ def _load_sibling(name, *parts):
 
 
 try:
-    from ._codec_numba import run_numba, run_numba_delta, numba_safe, NUMBA_OK
+    from ._codec_numba import (run_numba, run_numba_delta, numba_safe, NUMBA_OK,
+                               encode_bi_numba, decode_bi_numba)
 except ImportError:
     _m = _load_sibling("_codec_numba", "_codec_numba.py")
     run_numba, run_numba_delta, numba_safe, NUMBA_OK = (
         _m.run_numba, _m.run_numba_delta, _m.numba_safe, _m.NUMBA_OK)
+    encode_bi_numba, decode_bi_numba = _m.encode_bi_numba, _m.decode_bi_numba
 
 try:
     from ..io.ccsds_header import pack_header, parse_header
@@ -543,6 +545,8 @@ class Ccsds123:
     # only the order in which codewords are emitted differs. With periodic updating, the
     # limit values for each period are written into the body at y mod 2^u == 0 (5.4.3.2.4.1).
     def _encode_bi(self, delta, period_abs=None, period_rel=None, u=0) -> bytes:
+        if self.use_numba:                                  # byte-identical fast path
+            return encode_bi_numba(self, delta, period_abs, period_rel, u)
         p = self.p
         Nz, Ny, Nx, D = p.num_bands, p.height, p.width, p.dynamic_range
         M, n_i = self._bi_blocks()
@@ -573,6 +577,8 @@ class Ccsds123:
     def _decode_bi(self, body):
         """Decode a BI body to (delta, period_abs, period_rel, u). The last three are
         None/0 unless periodic updating recovered per-period limits from the body."""
+        if self.use_numba:                                  # byte-identical fast path
+            return decode_bi_numba(self, body)
         p = self.p
         Nz, Ny, Nx, D = p.num_bands, p.height, p.width, p.dynamic_range
         M, n_i = self._bi_blocks()
