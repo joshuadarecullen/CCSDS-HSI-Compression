@@ -242,6 +242,38 @@ def test_periodic_error_limits():
           f"every period bound respected  ratio={st['ratio']:.3f}:1")
 
 
+def test_bi_numba_identical():
+    """The numba BI sample-adaptive coder must be byte-identical to the pure-Python one."""
+    if not getattr(rc, "NUMBA_OK", False):
+        print("  numba not available - skipping (BI coder runs pure-Python)")
+        return
+    img = cube(10, 16, 16, seed=5)
+    Nz, Ny, Nx = img.shape
+    nper, nper2 = (Ny + 1) >> 1, (Ny + 3) >> 2
+    configs = [
+        dict(interleave_depth=Nz),                                              # BIP lossless
+        dict(interleave_depth=1),                                               # BIL lossless
+        dict(interleave_depth=4),                                               # intermediate M
+        dict(interleave_depth=Nz, absolute_error_limit=4),                      # near-lossless
+        dict(interleave_depth=Nz, update_period_exp=1,
+             absolute_error_limit=[(p % 5) for p in range(nper)]),              # periodic band-indep
+        dict(interleave_depth=1, update_period_exp=2,
+             absolute_error_limit=[[(z + p) % 4 for z in range(Nz)] for p in range(nper2)]),  # band-dep
+        dict(interleave_depth=Nz, update_period_exp=2,
+             relative_error_limit=[32 * (p + 1) for p in range(nper2)]),        # periodic relative
+    ]
+    for kw in configs:
+        p = CodecParams(num_bands=Nz, height=Ny, width=Nx, dynamic_range=16,
+                        encoding_order="BI", **kw)
+        cn = Ccsds123(p); cn.use_numba = True
+        cp = Ccsds123(p); cp.use_numba = False
+        assert cn.use_numba, "numba should be active here"
+        bn, bp = cn.compress(img), cp.compress(img)
+        assert bn == bp, f"BI numba bytes differ from pure-Python for {kw}"
+        assert np.array_equal(cn.decompress(bn), cp.decompress(bp)), f"BI numba decode differs for {kw}"
+    print(f"  BI numba coder BYTE-IDENTICAL to pure-Python + round-trip OK ({len(configs)} configs)")
+
+
 def test_lossless_crop():
     img = cube(24, 32, 32)
     out, st = _roundtrip(img, num_prediction_bands=3, full=True)
@@ -320,7 +352,7 @@ if __name__ == "__main__":
     for fn in (test_map_unmap_roundtrip, test_ccsds_header, test_hybrid_codec,
                test_numba_byte_identical, test_hybrid_numba_identical,
                test_package_imports_without_torch, test_metrics,
-               test_bi_order, test_periodic_error_limits,
+               test_bi_order, test_periodic_error_limits, test_bi_numba_identical,
                test_lossless_crop, test_reduced_mode,
                test_sample_rep_phi, test_narrow_local_sums, test_near_lossless,
                test_band_dependent_error_limits, test_lossless_region,
