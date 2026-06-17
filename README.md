@@ -175,5 +175,5 @@ python3 examples/plot_benchmark.py --csv assets/benchmark_local.csv \
    Multispectral and Hyperspectral Image Compression*.
 3. Klimesh, *Fast Lossless Compression of Multispectral Images*, 2005.
 
-For research and educational use. The CCSDS specifications are publicly available from
-the Consultative Committee for Space Data Systems.
+Released under the MIT License; see [LICENSE](LICENSE). The CCSDS specifications are
+publicly available from the Consultative Committee for Space Data Systems.
