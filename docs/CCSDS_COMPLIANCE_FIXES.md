@@ -6,7 +6,7 @@ CCSDS-123.0-B-2 but not its *algorithm*: the predictor never adapted its weights
 "full" mode was disabled by a constructor bug, the mapped quantizer index ignored
 the standard's fold-over mapping, the hybrid coder produced an undecodable
 bitstream, and `decompress()` returned the encoder-side reconstruction without
-ever decoding the body — so "lossless" was never tested through the entropy coder.
+ever decoding the body, so "lossless" was never tested through the entropy coder.
 
 The replacement is pure-integer; the encoder and decoder share a single prediction
 loop, so encode → decode is bit-exact by construction. Both standard entropy
@@ -16,7 +16,7 @@ coders are implemented and forward/reverse-decodable.
 
 - **Local sums** (eq 20-23): wide/narrow × neighbor/column, with the correct
   boundary cases (right-column `W+NW+2·N` and the previous-band terms).
-- **Local differences** (eq 24-27) and the difference vector in standard order —
+- **Local differences** (eq 24-27) and the difference vector in standard order:
   directionals, then `P*_z = min(z,P)` centrals (eq 28-29).
 - **Weights**: default init (eq 33-34) with `ω_min=−2^(Ω+2)`, `ω_max=2^(Ω+2)−1`
   (eq 30); update (eq 49-54) with the double-resolution error and time-varying
@@ -33,7 +33,7 @@ coders are implemented and forward/reverse-decodable.
   adaptive accumulator/counter statistics and a matching forward decoder.
 - **Hybrid coder** (5.4.3.3): high/low-entropy classification, reversed
   length-limited GPO2 high-entropy codes, the 16 annex-B variable-to-variable
-  low-entropy codes (`entropy/annexb_tables.json` — complete, prefix-free,
+  low-entropy codes (`entropy/annexb_tables.json`: complete, prefix-free,
   suffix-free, matching the spec's worked examples), the escape mechanism, the
   compressed-image tail, and reverse-order decoding (reverse the body and decode
   forward through prefix-free tries). Selected with `entropy_coder="hybrid"`.
@@ -57,14 +57,14 @@ Lossless (`m=0`), **absolute** (`a_z`), **relative** (`⌊r_z|ŝ|/2^D⌋`) and
 **combined** (`min`) error limits, each band-independent (a scalar) or
 band-dependent (a length-`num_bands` list). The bound is enforced exactly per band.
 Not implemented: periodic error-limit updating (4.8.2.4), which needs
-band-interleaved (BI) order — this codec processes in BSQ order.
+band-interleaved (BI) order, whereas this codec processes in BSQ order.
 
 ## Scope
 
 - **Entropy coders**: sample-adaptive (default) and hybrid, both bit-exact and
   numba-accelerated. The block-adaptive option (5.4.3.4 / CCSDS-121) is not
   implemented.
-- **Header**: a bit-exact CCSDS 5.3 header (`io/ccsds_header.py`) — Image Metadata
+- **Header**: a bit-exact CCSDS 5.3 header (`io/ccsds_header.py`): Image Metadata
   Essential, Predictor Metadata Primary + Quantization + Sample Representative, and
   the Entropy Coder Metadata. Pack/parse round-trips every parameter; the lossless
   header is 19 bytes. Not emitted: supplementary information tables, custom
