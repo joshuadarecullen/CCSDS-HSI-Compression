@@ -117,7 +117,7 @@ def main():
         low_rate(lr, datasets_by_ratio(lr), args.out)
         print(f"wrote low_rate.png to {args.out}/")
     _lines(rows, datasets, "bpppb", "psnr_db", True,
-           "Rate–distortion (hybrid coder, near-lossless)",
+           "Rate-distortion (hybrid coder, near-lossless)",
            "bits per pixel per band (bpppb)", "PSNR (dB)", "rate_distortion.png", args.out)
     _lines(rows, datasets, "limit", "ratio", False,
            "Compression ratio vs error limit (hybrid coder)",
