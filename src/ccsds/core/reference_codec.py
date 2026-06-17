@@ -156,14 +156,52 @@ class CodecParams:
     # entropy coder selection
     entropy_coder: str = "sample_adaptive"   # 'sample_adaptive' | 'hybrid'
 
+    # input order (5.4.2): 'BSQ' (default) or 'BI' (band-interleaved)
+    encoding_order: str = "BSQ"      # 'BSQ' | 'BI'
+    interleave_depth: int = 0        # M for BI: 1=BIL .. num_bands=BIP; 0 => num_bands
+    # periodic error-limit updating (4.8.2.4): u in 0..9 (-1 = off). When on, the
+    # error-limit params are per-period lists of length ceil(height / 2^u), BI order
+    # is required, and the limit values travel in the body rather than the header.
+    update_period_exp: int = -1
+    abs_bits: int = 0                # DA override (0 => derive from values); set on header parse
+    rel_bits: int = 0                # DR override
+
     @staticmethod
     def _limit_max(v) -> int:
         return max(v) if isinstance(v, (list, tuple)) else v
 
     @property
+    def periodic(self) -> bool:
+        return self.update_period_exp >= 0
+
+    @property
     def lossless(self) -> bool:
+        if self.periodic:
+            return False
         return self._limit_max(self.absolute_error_limit) == 0 and \
             self._limit_max(self.relative_error_limit) == 0
+
+    def fidelity_layout(self):
+        """(abs_used, rel_used, band_dep_abs, band_dep_rel, DA, DR) for the quantizer
+        metadata, covering both fixed and periodic (per-period) error limits."""
+        a, r = self.absolute_error_limit, self.relative_error_limit
+        if self.periodic:
+            au, ru = a != 0, r != 0
+            da = au and isinstance(a[0], (list, tuple))
+            dr = ru and isinstance(r[0], (list, tuple))
+            def depth(used, arr, override):
+                if not used:
+                    return 0
+                if override:
+                    return override
+                m = max(max(e) if isinstance(e, (list, tuple)) else e for e in arr)
+                return max(1, int(m).bit_length())
+            return au, ru, da, dr, depth(au, a, self.abs_bits), depth(ru, r, self.rel_bits)
+        au, ru = self._limit_max(a) > 0, self._limit_max(r) > 0
+        da, dr = au and isinstance(a, (list, tuple)), ru and isinstance(r, (list, tuple))
+        DA = max(1, int(self._limit_max(a)).bit_length()) if au else 0
+        DR = max(1, int(self._limit_max(r)).bit_length()) if ru else 0
+        return au, ru, da, dr, DA, DR
 
     def validate(self) -> None:
         D = self.dynamic_range
@@ -183,10 +221,27 @@ class CodecParams:
         assert 8 <= self.u_max <= 32
         assert 0 <= self.k_init <= min(D - 2, 14)
         assert self.entropy_coder in ("sample_adaptive", "hybrid")
-        for lim in (self.absolute_error_limit, self.relative_error_limit):
-            if isinstance(lim, (list, tuple)):
-                assert len(lim) == self.num_bands, \
-                    "per-band error-limit list must have length num_bands"
+        assert self.encoding_order in ("BSQ", "BI")
+        if self.encoding_order == "BI":
+            M = self.interleave_depth or self.num_bands
+            assert 1 <= M <= self.num_bands, "interleave_depth M must be in 1..num_bands"
+            assert self.entropy_coder == "sample_adaptive", \
+                "BI order is implemented for the sample-adaptive coder"
+        if self.periodic:
+            assert 0 <= self.update_period_exp <= 9, "update period exponent u must be 0..9"
+            assert self.encoding_order == "BI", "periodic error-limit updating requires BI order"
+            nper = (self.height + (1 << self.update_period_exp) - 1) >> self.update_period_exp
+            for lim in (self.absolute_error_limit, self.relative_error_limit):
+                if lim != 0:
+                    assert len(lim) == nper, f"periodic error-limit list must have length {nper}"
+                    for v in lim:
+                        if isinstance(v, (list, tuple)):
+                            assert len(v) == self.num_bands, "band-dependent period entry needs num_bands values"
+        else:
+            for lim in (self.absolute_error_limit, self.relative_error_limit):
+                if isinstance(lim, (list, tuple)):
+                    assert len(lim) == self.num_bands, \
+                        "per-band error-limit list must have length num_bands"
         if self.local_sum_type not in (
             "wide_neighbor", "narrow_neighbor", "wide_column", "narrow_column"
         ):
@@ -317,14 +372,16 @@ class Ccsds123:
         s_hat = s_breve >> 1                                # Eq (39)
         return s_tilde, s_breve, s_hat
 
-    # quantizer fidelity (Eq 42-45)
-    def _max_error(self, s_hat: int, z: int) -> int:
+    # quantizer fidelity (Eq 42-45). al/rl are this sample's active limits; they
+    # default to the per-image limits, or are the period's limits when periodic.
+    def _max_error(self, s_hat: int, z: int, al=None, rl=None) -> int:
         p = self.p
-        if p.lossless:
-            return 0
-        al, rl = p.absolute_error_limit, p.relative_error_limit
+        if al is None:
+            al, rl = p.absolute_error_limit, p.relative_error_limit
         a = al[z] if isinstance(al, (list, tuple)) else al      # band-dependent or -independent
         r = rl[z] if isinstance(rl, (list, tuple)) else rl
+        if a == 0 and r == 0:
+            return 0
         if r == 0:
             return a
         rel = (r * abs(s_hat)) >> p.dynamic_range
@@ -433,14 +490,132 @@ class Ccsds123:
             c += 1
         return r.read_bits(p.dynamic_range)                # escape
 
+    # sample-adaptive counter schedule (data-independent), Eq 57/60/61
+    def _gamma_seq(self, N: int):
+        full = (1 << self.p.gamma_star) - 1
+        G = [0] * N
+        resc = [False] * N
+        g = 1 << self.p.gamma0
+        for t in range(1, N):
+            G[t] = g
+            if g < full:
+                g += 1
+            else:
+                resc[t] = True
+                g = (g + 1) >> 1
+        return G, resc
+
+    def _bi_blocks(self):
+        Nz, M = self.p.num_bands, (self.p.interleave_depth or self.p.num_bands)
+        return M, (Nz + M - 1) // M
+
+    def _period_arrays(self):
+        """Per-period error limits (4.8.2.4): lists indexed by period p = y >> u, each
+        entry a scalar (band-independent) or a [num_bands] list (band-dependent)."""
+        p = self.p
+        u = p.update_period_exp
+        nper = (p.height + (1 << u) - 1) >> u
+        expand = lambda lim: list(lim) if lim != 0 else [0] * nper
+        return expand(p.absolute_error_limit), expand(p.relative_error_limit), u
+
+    def _limit_layout(self, *_):
+        # Bit depths DA/DR are fixed for the whole image (4.8.2.4.3).
+        return self.p.fidelity_layout()
+
+    def _emit_limits(self, w, av, rv, lay):
+        au, ru, da, dr, DA, DR = lay
+        if au:
+            for v in (av if da else [av]):
+                w.write_bits(int(v), DA)
+        if ru:
+            for v in (rv if dr else [rv]):
+                w.write_bits(int(v), DR)
+
+    def _read_limits(self, r, lay):
+        au, ru, da, dr, DA, DR = lay
+        Nz = self.p.num_bands
+        av = ([r.read_bits(DA) for _ in range(Nz)] if da else r.read_bits(DA)) if au else 0
+        rv = ([r.read_bits(DR) for _ in range(Nz)] if dr else r.read_bits(DR)) if ru else 0
+        return av, rv
+
+    # Band-interleaved (BI) sample-adaptive coding of the mapped-index array (5.4.2.2).
+    # Each band's accumulator evolves over its own raster sequence exactly as in BSQ;
+    # only the order in which codewords are emitted differs. With periodic updating, the
+    # limit values for each period are written into the body at y mod 2^u == 0 (5.4.3.2.4.1).
+    def _encode_bi(self, delta, period_abs=None, period_rel=None, u=0) -> bytes:
+        p = self.p
+        Nz, Ny, Nx, D = p.num_bands, p.height, p.width, p.dynamic_range
+        M, n_i = self._bi_blocks()
+        G, resc = self._gamma_seq(Ny * Nx)
+        sigma = [self._sigma_init()] * Nz
+        periodic = period_abs is not None
+        lay = self._limit_layout(period_abs, period_rel) if periodic else None
+        w = BitWriter()
+        for y in range(Ny):
+            if periodic and y % (1 << u) == 0:
+                pi = y >> u
+                self._emit_limits(w, period_abs[pi], period_rel[pi], lay)
+            for i in range(n_i):
+                for x in range(Nx):
+                    for z in range(i * M, min((i + 1) * M, Nz)):
+                        t = y * Nx + x
+                        d = int(delta[z, y, x])
+                        if t == 0:
+                            w.write_bits(d, D)
+                        else:
+                            self._gpo2_encode(w, d, self._code_param(sigma[z], G[t]))
+                            if not resc[t]:
+                                sigma[z] += d
+                            else:
+                                sigma[z] = (sigma[z] + d + 1) >> 1
+        return w.to_bytes()
+
+    def _decode_bi(self, body):
+        """Decode a BI body to (delta, period_abs, period_rel, u). The last three are
+        None/0 unless periodic updating recovered per-period limits from the body."""
+        p = self.p
+        Nz, Ny, Nx, D = p.num_bands, p.height, p.width, p.dynamic_range
+        M, n_i = self._bi_blocks()
+        G, resc = self._gamma_seq(Ny * Nx)
+        sigma = [self._sigma_init()] * Nz
+        r = BitReader(body)
+        delta = np.zeros((Nz, Ny, Nx), dtype=np.int64)
+        periodic = p.periodic
+        if periodic:
+            period_abs, period_rel, u = self._period_arrays()
+            lay = self._limit_layout(period_abs, period_rel)
+            got_abs, got_rel = [0] * len(period_abs), [0] * len(period_rel)
+        for y in range(Ny):
+            if periodic and y % (1 << u) == 0:
+                pi = y >> u
+                got_abs[pi], got_rel[pi] = self._read_limits(r, lay)
+            for i in range(n_i):
+                for x in range(Nx):
+                    for z in range(i * M, min((i + 1) * M, Nz)):
+                        t = y * Nx + x
+                        if t == 0:
+                            d = r.read_bits(D)
+                        else:
+                            d = self._gpo2_decode(r, self._code_param(sigma[z], G[t]))
+                            if not resc[t]:
+                                sigma[z] += d
+                            else:
+                                sigma[z] = (sigma[z] + d + 1) >> 1
+                        delta[z, y, x] = d
+        if periodic:
+            return delta, got_abs, got_rel, u
+        return delta, None, None, 0
+
     # shared encode/decode loop
-    def _run(self, encode: bool, image=None, body=None, collect_delta=False, delta_in=None):
+    def _run(self, encode: bool, image=None, body=None, collect_delta=False, delta_in=None,
+             period_abs=None, period_rel=None, u_period=0):
         # collect_delta (encode) returns the mapped-index array instead of a body;
-        # delta_in (decode) reconstructs from a mapped-index array. Both are used by
-        # the hybrid coder, whose decode is reverse-order and cannot interleave with
-        # the causal predictor. Sample-adaptive entropy I/O is skipped in those modes.
+        # delta_in (decode) reconstructs from a mapped-index array. Both are used by the
+        # hybrid and BI coders, whose entropy I/O is decoupled from the causal predictor.
+        # period_abs/period_rel supply per-period error limits (4.8.2.4, pure-Python only).
         hybrid_mode = collect_delta or (delta_in is not None)
-        if self.use_numba:                                   # byte-identical fast path
+        periodic = period_abs is not None
+        if self.use_numba and not periodic:                  # byte-identical fast path
             if not hybrid_mode:
                 return run_numba(self, encode, image, body)
             return run_numba_delta(self, encode, image=image, delta=delta_in)
@@ -460,6 +635,10 @@ class Ccsds123:
             gamma = 1 << p.gamma0                            # Gamma(1)  (Eq 57)
             sigma_acc = self._sigma_init()                  # Sigma_z(1) (Eq 58)
             for y in range(Ny):
+                if periodic:                                # active limits for this row's period
+                    al, rl = period_abs[y >> u_period], period_rel[y >> u_period]
+                else:
+                    al, rl = p.absolute_error_limit, p.relative_error_limit
                 for x in range(Nx):
                     t = y * Nx + x
                     if t == 0:
@@ -470,7 +649,7 @@ class Ccsds123:
                         U = self._local_diffs(spp, cdiff, z, y, x, sigma)
                         s_tilde, s_breve, s_hat = self._predict(spp, weights, U, sigma, z, y, x, t)
 
-                    m = self._max_error(s_hat, z)
+                    m = self._max_error(s_hat, z, al, rl)
                     lo, hi, theta = self._theta(s_hat, m, t)
 
                     if encode:
@@ -538,8 +717,17 @@ class Ccsds123:
         if p.entropy_coder == "hybrid":                     # predictor -> mapped indices -> hybrid
             delta = self._run(encode=True, image=img, collect_delta=True)
             body = self._hybrid().encode(delta)
+        elif p.encoding_order == "BI":                      # predictor -> mapped indices -> BI coder
+            if p.periodic:
+                pa, pr, u = self._period_arrays()
+                delta = self._run(encode=True, image=img, collect_delta=True,
+                                  period_abs=pa, period_rel=pr, u_period=u)
+                body = self._encode_bi(delta, period_abs=pa, period_rel=pr, u=u)
+            else:
+                delta = self._run(encode=True, image=img, collect_delta=True)
+                body = self._encode_bi(delta)
         else:
-            body = self._run(encode=True, image=img)        # sample-adaptive (interleaved)
+            body = self._run(encode=True, image=img)        # sample-adaptive, BSQ (interleaved)
         return header + body
 
     def decompress(self, blob: bytes) -> np.ndarray:
@@ -548,6 +736,12 @@ class Ccsds123:
         body = blob[parse_header(blob)[1]:]
         if p.entropy_coder == "hybrid":
             delta = self._hybrid().decode(body, (p.num_bands, p.height, p.width))
+            return self._run(encode=False, delta_in=delta)
+        if p.encoding_order == "BI":
+            delta, pa, pr, u = self._decode_bi(body)
+            if pa is not None:
+                return self._run(encode=False, delta_in=delta,
+                                 period_abs=pa, period_rel=pr, u_period=u)
             return self._run(encode=False, delta_in=delta)
         return self._run(encode=False, body=body)
 

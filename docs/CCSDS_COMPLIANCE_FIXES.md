@@ -56,19 +56,23 @@ Through the real bitstream (`python3 tests/test_reference_codec.py`):
 Lossless (`m=0`), **absolute** (`a_z`), **relative** (`⌊r_z|ŝ|/2^D⌋`) and
 **combined** (`min`) error limits, each band-independent (a scalar) or
 band-dependent (a length-`num_bands` list). The bound is enforced exactly per band.
-Not implemented: periodic error-limit updating (4.8.2.4), which needs
-band-interleaved (BI) order, whereas this codec processes in BSQ order.
+**Periodic error-limit updating** (4.8.2.4) is supported in band-interleaved order:
+per-period limits are carried in the body and applied as `period = y >> u`.
 
 ## Scope
 
 - **Entropy coders**: sample-adaptive (default) and hybrid, both bit-exact and
   numba-accelerated. The block-adaptive option (5.4.3.4 / CCSDS-121) is not
   implemented.
+- **Encoding order** (5.4.2): BSQ and band-interleaved (BI: BIP / BIL / intermediate
+  sub-frame depth M), the latter with optional periodic error-limit updating
+  (4.8.2.4). The BI sample-adaptive coder is pure-Python (not yet numba-accelerated).
 - **Header**: a bit-exact CCSDS 5.3 header (`io/ccsds_header.py`): Image Metadata
   Essential, Predictor Metadata Primary + Quantization + Sample Representative, and
   the Entropy Coder Metadata. Pack/parse round-trips every parameter; the lossless
-  header is 19 bytes. Not emitted: supplementary information tables, custom
-  weight-init / weight-exponent tables, periodic error-limit updating, BI order.
+  header is 19 bytes (BI order adds the Sub-Frame Interleaving Depth and, when
+  near-lossless, the Error Limit Update Period block). Not emitted: supplementary
+  information tables and custom weight-init / weight-exponent tables.
 - **Performance**: a numba kernel (`_codec_numba.py`) mirrors the pure-Python `_run`
   byte-for-byte and runs ~100-200× faster (the full 145×145×220 cube compresses and
   decompresses in ~1 s each way); the pure-Python path is the readable fallback.

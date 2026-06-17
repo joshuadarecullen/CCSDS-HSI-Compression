@@ -81,11 +81,14 @@ def test_ccsds_header():
         dict(num_bands=5, height=4, width=4, dynamic_range=16,
              absolute_error_limit=[i % 4 for i in range(5)]),                             # band-dependent
         dict(num_bands=8, height=8, width=8, dynamic_range=16, entropy_coder="hybrid"),   # hybrid coder
+        dict(num_bands=8, height=8, width=8, dynamic_range=16, encoding_order="BI",
+             interleave_depth=8, absolute_error_limit=4),                                  # BI order
     ]
     fields = ("num_bands", "height", "width", "dynamic_range", "signed", "num_prediction_bands",
               "full", "local_sum_type", "omega", "register_size", "theta", "phi", "psi",
               "absolute_error_limit", "relative_error_limit", "v_min", "v_max", "t_inc",
-              "gamma0", "gamma_star", "u_max", "k_init", "entropy_coder")
+              "gamma0", "gamma_star", "u_max", "k_init", "entropy_coder",
+              "encoding_order", "interleave_depth", "update_period_exp")
     for kw in cases:
         p = CodecParams(**kw)
         hdr = rc.pack_header(p)
@@ -200,6 +203,45 @@ def test_metrics():
           f"PSNR={rep['psnr_db']:.1f}dB MSSIM={rep['mssim']:.4f} SAM={rep['sam_rad']:.2e}rad")
 
 
+def test_bi_order():
+    """Band-interleaved (BI) encoding order (5.4.2.2): BIP, BIL and intermediate M,
+    lossless and near-lossless, decoded through the header."""
+    img = cube(16, 24, 24)
+    Nz = img.shape[0]
+    for M, tag in [(Nz, "BIP"), (1, "BIL"), (4, "M=4")]:
+        out, st = _roundtrip(img, encoding_order="BI", interleave_depth=M)
+        assert np.array_equal(img, out), f"BI {tag} lossless round-trip failed"
+    out, st = _roundtrip(img, encoding_order="BI", interleave_depth=Nz, absolute_error_limit=4)
+    err = int(np.abs(img - out).max())
+    assert err <= 4, f"BI near-lossless error {err} exceeds 4"
+    print(f"  BI order (BIP/BIL/M=4) lossless + near-lossless(a=4, max|err|={err}): OK  "
+          f"ratio={st['ratio']:.3f}:1")
+
+
+def test_periodic_error_limits():
+    """Periodic error-limit updating (4.8.2.4): per-period limits carried in the body,
+    decoded standalone; each period must respect its own bound."""
+    img = cube(12, 16, 16)
+    Nz, Ny, Nx = img.shape
+    u = 1
+    nper = (Ny + (1 << u) - 1) >> u
+    abs_bi = [(p % 5) for p in range(nper)]                      # band-independent, varies per period
+    out, st = _roundtrip(img, encoding_order="BI", interleave_depth=Nz,
+                         update_period_exp=u, absolute_error_limit=abs_bi)
+    for y in range(Ny):
+        e = int(np.abs(img[:, y, :] - out[:, y, :]).max())
+        assert e <= abs_bi[y >> u], f"row {y} (period {y >> u}): err {e} > limit {abs_bi[y >> u]}"
+    abs_bd = [[(z + p) % 4 for z in range(Nz)] for p in range((Ny + 3) >> 2)]   # band-dependent
+    out2, _ = _roundtrip(img, encoding_order="BI", interleave_depth=1,
+                         update_period_exp=2, absolute_error_limit=abs_bd)
+    for y in range(Ny):
+        for z in range(Nz):
+            e = int(np.abs(img[z, y, :] - out2[z, y, :]).max())
+            assert e <= abs_bd[y >> 2][z], f"band {z} row {y}: err {e} > {abs_bd[y >> 2][z]}"
+    print(f"  periodic error limits (band-indep {abs_bi} + band-dep, decoded standalone): "
+          f"every period bound respected  ratio={st['ratio']:.3f}:1")
+
+
 def test_lossless_crop():
     img = cube(24, 32, 32)
     out, st = _roundtrip(img, num_prediction_bands=3, full=True)
@@ -278,6 +320,7 @@ if __name__ == "__main__":
     for fn in (test_map_unmap_roundtrip, test_ccsds_header, test_hybrid_codec,
                test_numba_byte_identical, test_hybrid_numba_identical,
                test_package_imports_without_torch, test_metrics,
+               test_bi_order, test_periodic_error_limits,
                test_lossless_crop, test_reduced_mode,
                test_sample_rep_phi, test_narrow_local_sums, test_near_lossless,
                test_band_dependent_error_limits, test_lossless_region,

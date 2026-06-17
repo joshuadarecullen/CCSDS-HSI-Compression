@@ -55,14 +55,17 @@ recon = CCSDS123.decompress_bytes(blob)
   the fold-over mapped quantizer index.
 - **Fidelity control** (4.8.2): lossless, absolute, relative, and combined error
   limits, each band-independent or band-dependent.
+- **Encoding order** (5.4.2): BSQ (default) or band-interleaved (BI: BIP, BIL, or an
+  intermediate sub-frame depth M), with optional **periodic error-limit updating**
+  (4.8.2.4) that carries per-period limits in the body.
 - **Two entropy coders**: sample-adaptive (5.4.3.2, default) and hybrid (5.4.3.3,
   `entropy_coder="hybrid"`) using the real annex-B low-entropy tables with
   reverse-order suffix-free decoding.
 - **Bit-exact CCSDS 5.3 header** (`io/ccsds_header.py`): packs/parses every supported
   parameter; the lossless header is 19 bytes.
 
-Not implemented: the block-adaptive coder (5.4.3.4 / CCSDS-121), periodic error-limit
-updating (needs BI order), and the optional supplementary / weight tables.
+Not implemented: the block-adaptive coder (5.4.3.4 / CCSDS-121) and the optional
+supplementary / weight tables.
 
 ## Layout
 
