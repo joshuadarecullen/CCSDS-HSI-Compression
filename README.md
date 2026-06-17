@@ -122,7 +122,7 @@ the limit, and PSNR is reported against each scene's data peak.
 
 ![Lossless ratio by dataset](assets/lossless_ratio.png)
 
-Lossless is **1.77–4.21:1** (median ~2:1). Near-lossless scales much further — Salinas reaches
+Lossless is **1.77-4.21:1** (median ~2:1). Near-lossless scales much further. Salinas reaches
 **54:1** at an error limit of 64. The hybrid coder ties sample-adaptive when lossless but pulls
 well ahead as the limit grows (it packs the mostly-zero residuals into sub-1-bit codes).
 
@@ -157,7 +157,7 @@ trade down into the 20s (urban_r162 25 dB at 0.32 bpppb). Salinas holds roughly 
 band. This sweep runs the hybrid coder out to an error limit of 512.
 
 Reproduce (reads `<dataset>/zarr/cube.zarr`, needs `zarr`; non-integer/normalised cubes are
-auto-skipped — here `samson` was skipped as normalised and the 752M-sample `chikusei` by size):
+auto-skipped. Here `samson` was skipped as normalised and the 752M-sample `chikusei` by size):
 
 ```bash
 python3 examples/benchmark.py --root <data-dir> --out assets/benchmark_local.csv
