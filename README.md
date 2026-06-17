@@ -4,10 +4,7 @@ A pure-integer implementation of the CCSDS-123.0-B-2 standard for lossless and
 near-lossless multispectral / hyperspectral image compression.
 
 The encoder and decoder share a single prediction loop, so `compress -> decompress`
-is bit-exact by construction. Lossless really means lossless, verified through the
-actual entropy-coded bitstream rather than by stashing the reconstruction. The core
-is numpy-only; with [numba](https://numba.pydata.org/) installed a JIT fast path
-runs automatically (byte-identical to the reference, ~100-200x faster).
+is bit-exact by construction. The core is numpy; with [numba](https://numba.pydata.org/) installed a JIT fast path runs automatically (byte-identical to the reference, ~100-200x faster).
 
 ## Quick start
 
@@ -112,6 +109,47 @@ python3 examples/evaluate.py --input cube.npy --peak data     # PSNR vs the data
 
 On Indian Pines, lossless is ~2.47:1; the hybrid coder reaches ~16:1 at an absolute
 error limit of ~44 (every sample then within ±44 of the original).
+
+## Benchmark
+
+Whole-cube results across 14 standard HSI scenes (`examples/benchmark.py`, hybrid coder).
+Each scene is the raw integer DN cube; near-lossless bounds the per-sample error exactly by
+the limit, and PSNR is reported against each scene's data peak.
+
+![Rate-distortion](assets/rate_distortion.png)
+
+![Compression ratio vs error limit](assets/ratio_vs_limit.png)
+
+![Lossless ratio by dataset](assets/lossless_ratio.png)
+
+Lossless is **1.77–4.21:1** (median ~2:1). Near-lossless scales much further — Salinas reaches
+**54:1** at an error limit of 64. The hybrid coder ties sample-adaptive when lossless but pulls
+well ahead as the limit grows (it packs the mostly-zero residuals into sub-1-bit codes).
+
+| dataset | bands | D | lossless | a=4 | a=16 | a=64 |
+|---|--:|--:|--:|--:|--:|--:|
+| washington_dc | 191 | 16 | 4.21:1 | 7.2:1 | 11.9:1 | 24.2:1 |
+| ksc | 176 | 16 | 3.26:1 | 6.4:1 | 10.0:1 | 16.1:1 |
+| salinas | 204 | 14 | 2.86:1 | 7.2:1 | 18.9:1 | 54.1:1 |
+| botswana | 145 | 16 | 2.48:1 | 4.8:1 | 9.5:1 | 27.5:1 |
+| urban_r162 | 162 | 10 | 2.18:1 | 5.3:1 | 10.9:1 | 23.5:1 |
+| indian_pines | 220 | 14 | 2.17:1 | 4.2:1 | 7.8:1 | 17.4:1 |
+| cuprite_r188 | 188 | 16 | 2.13:1 | 3.7:1 | 6.0:1 | 11.4:1 |
+| jasper_f224 | 224 | 13 | 1.97:1 | 3.6:1 | 6.4:1 | 14.1:1 |
+| cuprite_f224 | 224 | 16 | 1.93:1 | 3.1:1 | 4.6:1 | 7.6:1 |
+| jasper_r198 | 198 | 13 | 1.91:1 | 3.5:1 | 6.2:1 | 13.6:1 |
+| houston2013 | 144 | 16 | 1.89:1 | 3.0:1 | 4.5:1 | 8.3:1 |
+| urban_f210 | 210 | 10 | 1.87:1 | 3.9:1 | 7.3:1 | 14.9:1 |
+| pavia_centre | 102 | 13 | 1.79:1 | 3.1:1 | 5.0:1 | 10.7:1 |
+| pavia_university | 103 | 13 | 1.77:1 | 3.1:1 | 4.9:1 | 10.2:1 |
+
+Reproduce (reads `<dataset>/zarr/cube.zarr`, needs `zarr`; non-integer/normalised cubes are
+auto-skipped — here `samson` was skipped as normalised and the 752M-sample `chikusei` by size):
+
+```bash
+python3 examples/benchmark.py --root <data-dir> --out assets/benchmark_local.csv
+python3 examples/plot_benchmark.py --csv assets/benchmark_local.csv --out assets
+```
 
 ## References
 
