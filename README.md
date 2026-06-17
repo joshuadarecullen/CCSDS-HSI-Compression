@@ -98,6 +98,20 @@ only numpy. If a local Indian Pines `.mat` is found it is exercised too (lossles
 ~2.49:1). With numba installed, the JIT kernels are checked byte-for-byte against the
 pure-Python reference.
 
+## Evaluating quality
+
+`tools/evaluate.py` compresses a cube at lossless and a sweep of near-lossless error
+limits and prints compression ratio with PSNR / MSSIM / SAM:
+
+```bash
+python3 tools/evaluate.py                                  # Indian Pines if present, else synthetic
+python3 tools/evaluate.py --entropy hybrid --limits 0 8 16 32 64
+python3 tools/evaluate.py --input cube.npy --peak data     # PSNR vs the data's actual peak
+```
+
+On Indian Pines, lossless is ~2.47:1; the hybrid coder reaches ~16:1 at an absolute
+error limit of ~44 (every sample then within ±44 of the original).
+
 ## References
 
 1. *Low-Complexity Lossless and Near-Lossless Multispectral and Hyperspectral Image
