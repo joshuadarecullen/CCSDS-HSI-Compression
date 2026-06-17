@@ -21,19 +21,6 @@ _LST = {"wide_neighbor": 0, "narrow_neighbor": 1, "wide_column": 2, "narrow_colu
 _LST_INV = {v: k for k, v in _LST.items()}
 
 
-def _is_list(v) -> bool:
-    return isinstance(v, (list, tuple))
-
-
-def _lmax(v) -> int:
-    return max(v) if _is_list(v) else int(v)
-
-
-def _bit_depth(v) -> int:
-    """Smallest DA/DR in [1, 16] that can hold the (max) limit value."""
-    return max(1, int(_lmax(v)).bit_length())
-
-
 class _BitPacker:
     def __init__(self) -> None:
         self.bits = bytearray()
@@ -85,8 +72,10 @@ def pack_header(p) -> bytes:
         raise NotImplementedError("non-zero weight-exponent offsets need the Weight Tables subpart")
     D = p.dynamic_range
     a, r = p.absolute_error_limit, p.relative_error_limit
-    has_a, has_r = (not p.lossless and _lmax(a) > 0), (not p.lossless and _lmax(r) > 0)
-    fc = 0 if p.lossless else (3 if (has_a and has_r) else 1 if has_a else 2)
+    au, ru, dep_a, dep_r, DA, DR = p.fidelity_layout()
+    fc = 0 if p.lossless else (3 if (au and ru) else 1 if au else 2)
+    bi = getattr(p, "encoding_order", "BSQ") == "BI"
+    periodic = getattr(p, "periodic", False)
 
     bp = _BitPacker()
     # Image Metadata, Essential (table 5-3)
@@ -98,8 +87,9 @@ def pack_header(p) -> bytes:
     bp.w(0, 1)                                  # Reserved
     bp.w(1 if D > 16 else 0, 1)                 # Large Dynamic Range Flag
     bp.w(D & 0xF, 4)                            # Dynamic Range (D mod 16)
-    bp.w(1, 1)                                  # Sample Encoding Order: BSQ
-    bp.w(0, 16)                                 # Sub-Frame Interleaving Depth (BSQ)
+    bp.w(0 if bi else 1, 1)                     # Sample Encoding Order: 0=BI, 1=BSQ
+    M = (p.interleave_depth or p.num_bands) if bi else 0
+    bp.w(M & 0xFFFF, 16)                         # Sub-Frame Interleaving Depth (M for BI)
     bp.w(0, 2)                                  # Reserved
     bp.w(1 & 0x7, 3)                            # Output Word Size B=1 (byte-aligned body)
     bp.w(1 if getattr(p, "entropy_coder", "sample_adaptive") == "hybrid" else 0, 2)  # Entropy Coder Type
@@ -128,25 +118,23 @@ def pack_header(p) -> bytes:
 
     # Predictor Metadata, Quantization subpart (near-lossless only)
     if not p.lossless:
-        # (BSQ -> Error Limit Update Period block omitted)
-        if has_a:
-            DA = _bit_depth(a)
-            bp.w(0, 1); bp.w(1 if _is_list(a) else 0, 1); bp.w(0, 2); bp.w(DA & 0xF, 4)
-            if _is_list(a):
-                for z in range(p.num_bands):
-                    bp.w(int(a[z]), DA)
-            else:
-                bp.w(int(a), DA)
-            bp.align()
-        if has_r:
-            DR = _bit_depth(r)
-            bp.w(0, 1); bp.w(1 if _is_list(r) else 0, 1); bp.w(0, 2); bp.w(DR & 0xF, 4)
-            if _is_list(r):
-                for z in range(p.num_bands):
-                    bp.w(int(r[z]), DR)
-            else:
-                bp.w(int(r), DR)
-            bp.align()
+        if bi:                                      # Error Limit Update Period block (table 5-9)
+            bp.w(0, 1)                              # Reserved
+            bp.w(1 if periodic else 0, 1)          # Periodic Updating Flag
+            bp.w(0, 2)                             # Reserved
+            bp.w((p.update_period_exp if periodic else 0) & 0xF, 4)   # update period exponent u
+        if au:                                      # Absolute Error Limit block (table 5-10)
+            bp.w(0, 1); bp.w(1 if dep_a else 0, 1); bp.w(0, 2); bp.w(DA & 0xF, 4)
+            if not periodic:                        # values in header (else carried in the body)
+                for v in (a if dep_a else [a]):
+                    bp.w(int(v), DA)
+                bp.align()
+        if ru:                                      # Relative Error Limit block (table 5-11)
+            bp.w(0, 1); bp.w(1 if dep_r else 0, 1); bp.w(0, 2); bp.w(DR & 0xF, 4)
+            if not periodic:
+                for v in (r if dep_r else [r]):
+                    bp.w(int(v), DR)
+                bp.align()
 
     # Predictor Metadata, Sample Representative subpart (Theta > 0)
     if p.theta > 0:
@@ -180,8 +168,8 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
         D = drange + 16 if drange != 0 else 32
     else:
         D = drange if drange != 0 else 16
-    u.r(1)                                      # Sample Encoding Order (BSQ)
-    u.r(16)                                     # Sub-Frame Interleaving Depth
+    order_bit = u.r(1)                          # Sample Encoding Order: 0=BI, 1=BSQ
+    M_field = u.r(16)                           # Sub-Frame Interleaving Depth
     u.r(2); u.r(3); ect = u.r(2); u.r(1)        # Reserved, Output Word Size, Entropy Coder Type, Reserved
     fc = u.r(2)                                 # Quantizer Fidelity Control Method
     u.r(2); u.r(4)                              # Reserved, Supplementary Information Table Count
@@ -201,23 +189,36 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
     u.r(1); u.r(1); u.r(1); u.r(5)             # weight exponent/init table flags + init resolution
 
     # Quantization subpart
+    bi = (order_bit == 0)
+    periodic = False
+    u_exp = -1
+    abs_bits = rel_bits = 0
     abs_lim, rel_lim = 0, 0
-    if fc in (1, 3):
-        u.r(1); band_dep = u.r(1); u.r(2); DA = u.r(4)
-        DA = DA if DA != 0 else 16
-        if band_dep:
-            abs_lim = [u.r(DA) for _ in range(Nz)]
-        else:
-            abs_lim = u.r(DA)
-        u.align()
-    if fc in (2, 3):
-        u.r(1); band_dep = u.r(1); u.r(2); DR = u.r(4)
-        DR = DR if DR != 0 else 16
-        if band_dep:
-            rel_lim = [u.r(DR) for _ in range(Nz)]
-        else:
-            rel_lim = u.r(DR)
-        u.align()
+    if fc != 0:
+        if bi:                                  # Error Limit Update Period block (table 5-9)
+            u.r(1); pflag = u.r(1); u.r(2); uu = u.r(4)
+            if pflag:
+                periodic = True
+                u_exp = uu
+        nper = (Ny + (1 << u_exp) - 1) >> u_exp if periodic else 0
+        if fc in (1, 3):
+            u.r(1); band_dep = u.r(1); u.r(2); DA = u.r(4)
+            DA = DA if DA != 0 else 16
+            if periodic:                        # values carried in the body, not the header
+                abs_bits = DA
+                abs_lim = [[0] * Nz for _ in range(nper)] if band_dep else [0] * nper
+            else:
+                abs_lim = [u.r(DA) for _ in range(Nz)] if band_dep else u.r(DA)
+                u.align()
+        if fc in (2, 3):
+            u.r(1); band_dep = u.r(1); u.r(2); DR = u.r(4)
+            DR = DR if DR != 0 else 16
+            if periodic:
+                rel_bits = DR
+                rel_lim = [[0] * Nz for _ in range(nper)] if band_dep else [0] * nper
+            else:
+                rel_lim = [u.r(DR) for _ in range(Nz)] if band_dep else u.r(DR)
+                u.align()
 
     # Sample Representative subpart
     theta, phi, psi = 0, 0, 0
@@ -248,5 +249,8 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
         v_min=v_min, v_max=v_max, t_inc=t_inc,
         gamma0=gamma0, gamma_star=gamma_star, u_max=u_max, k_init=k_init,
         entropy_coder=entropy_coder,
+        encoding_order=("BI" if bi else "BSQ"),
+        interleave_depth=(M_field if bi else 0),
+        update_period_exp=u_exp, abs_bits=abs_bits, rel_bits=rel_bits,
     )
     return params, u.nbytes
