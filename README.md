@@ -1,6 +1,6 @@
 # CCSDS-123.0-B-2 image codec
 
-A pure-integer implementation of the CCSDS-123.0-B-2 standard for lossless and
+A pure integer implementation of the CCSDS-123.0-B-2 standard for lossless and
 near-lossless multispectral / hyperspectral image compression.
 
 The encoder and decoder share a single prediction loop, so `compress -> decompress`
@@ -37,7 +37,7 @@ print(quality_report(img, recon, dynamic_range=16))
 # {'psnr_db': ..., 'mssim': ..., 'sam_rad': ..., 'max_abs_error': ...}
 ```
 
-Decode a blob without holding a configured codec; the parameters come from the
+Decode a blob without holding a configured codec, the parameters come from the
 header:
 
 ```python
@@ -47,9 +47,9 @@ recon = CCSDS123.decompress_bytes(blob)
 ## What it implements
 
 - **Adaptive predictor** (4.x): local sums (eq 20-23, wide/narrow × neighbor/column),
-  directional and central local differences, the full weight-update rule with the
-  time-varying scaling exponent ρ(t), high-resolution prediction, the quantizer, and
-  the fold-over mapped quantizer index.
+  directional and central local differences, the full weight update rule with the
+  time varying scaling exponent ρ(t), high-resolution prediction, the quantizer, and
+  the fold over mapped quantizer index.
 - **Fidelity control** (4.8.2): lossless, absolute, relative, and combined error
   limits, each band-independent or band-dependent.
 - **Encoding order** (5.4.2): BSQ (default) or band-interleaved (BI: BIP, BIL, or an
@@ -93,8 +93,7 @@ python3 tests/run_full_cube.py            # full 145×145×220-size cube
 
 The suite runs on a deterministic synthetic cube, so it works from a fresh clone with
 only numpy. If a local Indian Pines `.mat` is found it is exercised too (lossless,
-~2.49:1). With numba installed, the JIT kernels are checked byte-for-byte against the
-pure-Python reference.
+~2.49:1).
 
 ## Evaluating quality
 
@@ -113,7 +112,7 @@ error limit of ~44 (every sample then within ±44 of the original).
 ## Benchmark
 
 Whole-cube results across 14 standard HSI scenes (`examples/benchmark.py`, hybrid coder).
-Each scene is the raw integer DN cube; near-lossless bounds the per-sample error exactly by
+Each scene is the raw integer DN cube; near-lossless bounds the per sample error exactly by
 the limit, and PSNR is reported against each scene's data peak.
 
 ![Rate-distortion](assets/rate_distortion.png)
@@ -123,7 +122,7 @@ the limit, and PSNR is reported against each scene's data peak.
 ![Lossless ratio by dataset](assets/lossless_ratio.png)
 
 Lossless is **1.77-4.21:1** (median ~2:1). Near-lossless scales much further. Salinas reaches
-**54:1** at an error limit of 64. The hybrid coder ties sample-adaptive when lossless but pulls
+**54:1** at an error limit of 64. The hybrid coder ties sample adaptive when lossless but pulls
 well ahead as the limit grows (it packs the mostly-zero residuals into sub-1-bit codes).
 
 | dataset | bands | D | lossless | a=4 | a=16 | a=64 |
