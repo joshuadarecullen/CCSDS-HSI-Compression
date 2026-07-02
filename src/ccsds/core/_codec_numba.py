@@ -18,9 +18,12 @@ except Exception:  # pragma: no cover
     NUMBA_OK = False
 
     def njit(*a, **k):  # no-op fallback decorator
+        if a and callable(a[0]):                 # bare @njit form
+            return a[0]
+
         def wrap(f):
             return f
-        return wrap if (a and callable(a[0])) is False else a[0]
+        return wrap
 
 
 @njit
@@ -84,7 +87,7 @@ def _kparam(sigma, gamma, D):
 @njit
 def _kernel(encode, mode, delta_arr, image, body, buf, spp, recon, cdiff,
             Nz, Ny, Nx, D, P, full, lst, Omega, R, do_mod,
-            Theta, phi, psi, abs_lim, rel_lim, lossless,
+            Theta, phi, psi, abs_lim, rel_lim, abs_used, rel_used,
             vmin, vmax, tinc, zinter, zintra,
             gamma0, gstar_full, sigma_init, umax,
             s_min, s_max, s_mid, w_min, w_max):
@@ -149,18 +152,18 @@ def _kernel(encode, mode, delta_arr, image, body, buf, spp, recon, cdiff,
                     s_breve = s_tilde >> (Omega + 1)
                     s_hat = s_breve >> 1
 
-                # maximum error (Eq 42-45)
-                if lossless == 1:
+                # maximum error (Eq 42-45); limit-type use is image-level (4.8.2.1)
+                if abs_used == 0 and rel_used == 0:
                     m = 0
                 else:
                     a = abs_lim[z]
                     r = rel_lim[z]
-                    if r == 0:
+                    if rel_used == 0:
                         m = a
                     else:
                         ah = s_hat if s_hat >= 0 else -s_hat
                         rel = (r * ah) >> D
-                        if a == 0:
+                        if abs_used == 0:
                             m = rel
                         else:
                             m = a if a < rel else rel
@@ -192,7 +195,7 @@ def _kernel(encode, mode, delta_arr, image, body, buf, spp, recon, cdiff,
                     if aq > theta:
                         delta = aq + theta
                     else:
-                        parity = -1 if (s_hat & 1) else 1
+                        parity = -1 if (s_breve & 1) else 1     # (-1)^{s~_z(t)}, Eq (55)
                         if parity * q >= 0:
                             delta = 2 * aq
                         else:
@@ -258,7 +261,7 @@ def _kernel(encode, mode, delta_arr, image, body, buf, spp, recon, cdiff,
                         aq = delta - theta
                         q = aq if lo < hi else -aq
                     else:
-                        parity = -1 if (s_hat & 1) else 1
+                        parity = -1 if (s_breve & 1) else 1     # (-1)^{s~_z(t)}, Eq (55)
                         if (delta & 1) == 0:
                             q = (delta // 2) * parity
                         else:
@@ -344,9 +347,10 @@ def _setup(codec):
     sigma_init = ((3 * (1 << (kprime + 6)) - 49) * (1 << p.gamma0)) >> 7
     gstar_full = (1 << p.gamma_star) - 1
     do_mod = 1 if p.register_size <= 62 else 0
+    au, ru = p.fidelity_layout()[:2]
     args = (Nz, Ny, Nx, D, p.num_prediction_bands, 1 if p.full else 0, _LST[p.local_sum_type],
             p.omega, p.register_size, do_mod, p.theta, p.phi, p.psi, abs_lim, rel_lim,
-            1 if p.lossless else 0, p.v_min, p.v_max, p.t_inc, p.zeta_inter, p.zeta_intra,
+            1 if au else 0, 1 if ru else 0, p.v_min, p.v_max, p.t_inc, p.zeta_inter, p.zeta_intra,
             p.gamma0, gstar_full, sigma_init, p.u_max,
             codec.s_min, codec.s_max, codec.s_mid, codec.w_min, codec.w_max)
     return spp, recon, cdiff, args

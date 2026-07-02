@@ -15,6 +15,9 @@ except Exception:  # pragma: no cover
     NUMBA_OK = False
 
     def njit(*a, **k):
+        if a and callable(a[0]):                 # bare @njit form
+            return a[0]
+
         def wrap(f):
             return f
         return wrap

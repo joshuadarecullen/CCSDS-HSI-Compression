@@ -1,0 +1,7 @@
+# Keep the sdist self-consistent: full tests/ and examples/ (the README
+# documents commands using both), but not the standard PDF or benchmark assets.
+include LICENSE
+recursive-include tests *.py
+recursive-include examples *.py
+prune docs
+prune assets

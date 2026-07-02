@@ -1,9 +1,8 @@
-"""CCSDS-123.0-B-2 lossless / near-lossless hyperspectral image compression."""
-
-__version__ = "2.0.0"
+"""Repo-root shim so `import src.ccsds` works without installing; the real
+package (and its `__version__`) lives in src/ccsds/."""
 
 from .ccsds import (
-    CCSDS123, Ccsds123, CodecParams,
+    __version__, CCSDS123, Ccsds123, CodecParams,
     calculate_psnr, calculate_mssim, calculate_spectral_angle, quality_report)
 
 __all__ = ["CCSDS123", "Ccsds123", "CodecParams",

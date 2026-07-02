@@ -10,7 +10,7 @@ numpy-only.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
@@ -94,9 +94,6 @@ class BitWriter:
             self._n = 0
         return bytes(self._out)
 
-    def bit_length(self) -> int:
-        return len(self._out) * 8 + self._n
-
 
 class BitReader:
     def __init__(self, data: bytes) -> None:
@@ -141,6 +138,11 @@ class CodecParams:
     # int (band-independent) or a length-num_bands list (band-dependent {a_z}/{r_z}).
     absolute_error_limit: object = 0   # a_z
     relative_error_limit: object = 0   # r_z
+    # explicit fidelity-control mode (4.8.2.1): None = infer from the limit values
+    # (any nonzero => used). parse_header sets these from the header's fc field so
+    # that used-but-all-zero limits (legal; they force lossless bands) round-trip.
+    abs_limit_used: object = None
+    rel_limit_used: object = None
 
     # weight update (4.10)
     v_min: int = -1
@@ -153,7 +155,7 @@ class CodecParams:
     gamma0: int = 1                  # initial count exponent (1..8)
     gamma_star: int = 6              # rescaling counter size (max{4,gamma0+1}..11)
     u_max: int = 18                  # unary length limit (8..32)
-    k_init: int = 3                  # accumulator init constant K (0..min(D-2,14))
+    k_init: Optional[int] = None     # accumulator init constant K (0..min(D-2,14)); None = min(3, D-2)
 
     # entropy coder selection
     entropy_coder: str = "sample_adaptive"   # 'sample_adaptive' | 'hybrid'
@@ -167,6 +169,21 @@ class CodecParams:
     update_period_exp: int = -1
     abs_bits: int = 0                # DA override (0 => derive from values); set on header parse
     rel_bits: int = 0                # DR override
+
+    @staticmethod
+    def _norm_limit(v):
+        """Accept numpy arrays (including entries of periodic lists); -> plain lists."""
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        if isinstance(v, (list, tuple)) and any(isinstance(e, np.ndarray) for e in v):
+            return [e.tolist() if isinstance(e, np.ndarray) else e for e in v]
+        return v
+
+    def __post_init__(self):
+        self.absolute_error_limit = self._norm_limit(self.absolute_error_limit)
+        self.relative_error_limit = self._norm_limit(self.relative_error_limit)
+        if self.k_init is None:
+            self.k_init = min(3, max(0, self.dynamic_range - 2))
 
     @staticmethod
     def _limit_max(v) -> int:
@@ -188,7 +205,8 @@ class CodecParams:
         metadata, covering both fixed and periodic (per-period) error limits."""
         a, r = self.absolute_error_limit, self.relative_error_limit
         if self.periodic:
-            au, ru = a != 0, r != 0
+            au = (a != 0) if self.abs_limit_used is None else bool(self.abs_limit_used)
+            ru = (r != 0) if self.rel_limit_used is None else bool(self.rel_limit_used)
             da = au and isinstance(a[0], (list, tuple))
             dr = ru and isinstance(r[0], (list, tuple))
             def depth(used, arr, override):
@@ -199,7 +217,8 @@ class CodecParams:
                 m = max(max(e) if isinstance(e, (list, tuple)) else e for e in arr)
                 return max(1, int(m).bit_length())
             return au, ru, da, dr, depth(au, a, self.abs_bits), depth(ru, r, self.rel_bits)
-        au, ru = self._limit_max(a) > 0, self._limit_max(r) > 0
+        au = self._limit_max(a) > 0 if self.abs_limit_used is None else bool(self.abs_limit_used)
+        ru = self._limit_max(r) > 0 if self.rel_limit_used is None else bool(self.rel_limit_used)
         da, dr = au and isinstance(a, (list, tuple)), ru and isinstance(r, (list, tuple))
         DA = max(1, int(self._limit_max(a)).bit_length()) if au else 0
         DR = max(1, int(self._limit_max(r)).bit_length()) if ru else 0
@@ -208,6 +227,9 @@ class CodecParams:
     def validate(self) -> None:
         D = self.dynamic_range
         assert 2 <= D <= 32
+        assert 1 <= self.num_bands <= (1 << 16), "Nz must be in 1..2^16 (3.2)"
+        assert 1 <= self.height <= (1 << 16), "Ny must be in 1..2^16 (3.2)"
+        assert 1 <= self.width <= (1 << 16), "Nx must be in 1..2^16 (3.2)"
         assert 0 <= self.num_prediction_bands <= 15
         assert 4 <= self.omega <= 19
         assert max(32, D + self.omega + 2) <= self.register_size <= 64
@@ -221,7 +243,8 @@ class CodecParams:
         assert 1 <= self.gamma0 <= 8
         assert max(4, self.gamma0 + 1) <= self.gamma_star <= 11
         assert 8 <= self.u_max <= 32
-        assert 0 <= self.k_init <= min(D - 2, 14)
+        assert 0 <= self.k_init <= min(D - 2, 14), \
+            f"k_init {self.k_init} outside 0..min(D-2,14); use k_init=None to derive it from D"
         assert self.entropy_coder in ("sample_adaptive", "hybrid")
         assert self.encoding_order in ("BSQ", "BI")
         if self.encoding_order == "BI":
@@ -232,9 +255,19 @@ class CodecParams:
         if self.periodic:
             assert 0 <= self.update_period_exp <= 9, "update period exponent u must be 0..9"
             assert self.encoding_order == "BI", "periodic error-limit updating requires BI order"
+            assert self.absolute_error_limit != 0 or self.relative_error_limit != 0, \
+                "periodic updating requires at least one per-period error-limit list"
+            if self.abs_limit_used:
+                assert self.absolute_error_limit != 0, \
+                    "abs_limit_used=True requires per-period absolute error-limit lists"
+            if self.rel_limit_used:
+                assert self.relative_error_limit != 0, \
+                    "rel_limit_used=True requires per-period relative error-limit lists"
             nper = (self.height + (1 << self.update_period_exp) - 1) >> self.update_period_exp
             for lim in (self.absolute_error_limit, self.relative_error_limit):
                 if lim != 0:
+                    assert isinstance(lim, (list, tuple)), \
+                        "periodic error limits must be per-period lists, not scalars"
                     assert len(lim) == nper, f"periodic error-limit list must have length {nper}"
                     for v in lim:
                         if isinstance(v, (list, tuple)):
@@ -244,18 +277,38 @@ class CodecParams:
                 if isinstance(lim, (list, tuple)):
                     assert len(lim) == self.num_bands, \
                         "per-band error-limit list must have length num_bands"
+            if self.abs_limit_used is not None and not self.abs_limit_used:
+                assert self._limit_max(self.absolute_error_limit) == 0, \
+                    "abs_limit_used=False conflicts with a nonzero absolute_error_limit"
+            if self.rel_limit_used is not None and not self.rel_limit_used:
+                assert self._limit_max(self.relative_error_limit) == 0, \
+                    "rel_limit_used=False conflicts with a nonzero relative_error_limit"
+        # error-limit values must fit in DA/DR <= min(D-1, 16) bits (4.8.2.2, 4.8.2.3)
+        lim_bits = min(D - 1, 16)
+        for lim in (self.absolute_error_limit, self.relative_error_limit):
+            flat = []
+            if isinstance(lim, (list, tuple)):
+                for e in lim:
+                    if isinstance(e, (list, tuple)):
+                        flat.extend(e)
+                    else:
+                        flat.append(e)
+            else:
+                flat.append(lim)
+            for v in flat:
+                assert 0 <= int(v) < (1 << lim_bits), \
+                    f"error limit {v} does not fit in min(D-1,16)={lim_bits} bits"
         if self.local_sum_type not in (
             "wide_neighbor", "narrow_neighbor", "wide_column", "narrow_column"
         ):
             raise ValueError(f"bad local_sum_type {self.local_sum_type}")
         if self.width == 1:
             assert "column" in self.local_sum_type, "Nx=1 requires column-oriented local sums"
+            assert not self.full, "Nx=1 requires reduced prediction mode (4.3.1)"
 
 
 class Ccsds123:
     """CCSDS-123.0-B-2 compressor/decompressor (predictor + sample-adaptive coder)."""
-
-    MAGIC = b"C123"
 
     def __init__(self, params: CodecParams) -> None:
         params.validate()
@@ -271,6 +324,8 @@ class Ccsds123:
             self.s_mid = 1 << (D - 1)
         self.w_min = -(1 << (params.omega + 2))             # Eq (30)
         self.w_max = (1 << (params.omega + 2)) - 1
+        # image-level fidelity mode (4.8.2.1): which limit types are in use
+        self._abs_used, self._rel_used = params.fidelity_layout()[:2]
         # numba kernel when available and int64-safe; byte-identical to _run.
         # Set False to force the pure-Python path.
         self.use_numba = bool(NUMBA_OK and numba_safe(params))
@@ -376,20 +431,24 @@ class Ccsds123:
 
     # quantizer fidelity (Eq 42-45). al/rl are this sample's active limits; they
     # default to the per-image limits, or are the period's limits when periodic.
+    # Which limit types are in use is an image-level mode (4.8.2.1, matching the
+    # header's fidelity control field), not a per-value test: a limit of 0 in a
+    # band-dependent list is a valid value forcing that band lossless.
     def _max_error(self, s_hat: int, z: int, al=None, rl=None) -> int:
         p = self.p
         if al is None:
             al, rl = p.absolute_error_limit, p.relative_error_limit
+        au, ru = self._abs_used, self._rel_used
+        if not au and not ru:
+            return 0
         a = al[z] if isinstance(al, (list, tuple)) else al      # band-dependent or -independent
         r = rl[z] if isinstance(rl, (list, tuple)) else rl
-        if a == 0 and r == 0:
-            return 0
-        if r == 0:
-            return a
-        rel = (r * abs(s_hat)) >> p.dynamic_range
-        if a == 0:
+        if not ru:
+            return a                                            # Eq (43)
+        rel = (r * abs(s_hat)) >> p.dynamic_range               # Eq (44)
+        if not au:
             return rel
-        return min(a, rel)
+        return min(a, rel)                                      # Eq (45)
 
     # mapped quantizer index (Eq 55-56)
     def _theta(self, s_hat: int, m: int, t: int):
@@ -402,20 +461,23 @@ class Ccsds123:
             hi = (self.s_max - s_hat + m) // step
         return lo, hi, min(lo, hi)
 
-    def _map_index(self, q: int, s_hat: int, theta: int) -> int:
+    # Eq (55) keys the sign on the parity of the double-resolution predicted
+    # sample (the standard's s~_z(t), Eq 38; held here in s_breve), not on the
+    # predicted sample s_hat = s_breve >> 1.
+    def _map_index(self, q: int, s_breve: int, theta: int) -> int:
         aq = abs(q)
         if aq > theta:
             return aq + theta
-        parity = -1 if (s_hat & 1) else 1                   # (-1)^{s_hat}
+        parity = -1 if (s_breve & 1) else 1                 # (-1)^{s~_z(t)}
         if parity * q >= 0:
             return 2 * aq
         return 2 * aq - 1
 
-    def _unmap_index(self, delta: int, s_hat: int, lo: int, hi: int, theta: int) -> int:
+    def _unmap_index(self, delta: int, s_breve: int, lo: int, hi: int, theta: int) -> int:
         if delta > 2 * theta:                               # |q| > theta : sign forced
             aq = delta - theta
             return aq if lo < hi else -aq
-        parity = -1 if (s_hat & 1) else 1
+        parity = -1 if (s_breve & 1) else 1
         if delta % 2 == 0:
             return (delta // 2) * parity
         return -((delta + 1) // 2) * parity
@@ -621,6 +683,9 @@ class Ccsds123:
         # period_abs/period_rel supply per-period error limits (4.8.2.4, pure-Python only).
         hybrid_mode = collect_delta or (delta_in is not None)
         periodic = period_abs is not None
+        # refresh the image-level fidelity flags so params mutated after
+        # construction behave identically on the pure and numba paths
+        self._abs_used, self._rel_used = self.p.fidelity_layout()[:2]
         if self.use_numba and not periodic:                  # byte-identical fast path
             if not hybrid_mode:
                 return run_numba(self, encode, image, body)
@@ -666,7 +731,7 @@ class Ccsds123:
                         else:
                             sgn = (d > 0) - (d < 0)
                             q = sgn * ((abs(d) + m) // (2 * m + 1))
-                        delta = self._map_index(q, s_hat, theta)
+                        delta = self._map_index(q, s_breve, theta)
                         if collect_delta:
                             delta_out[z, y, x] = delta
                         elif t == 0:
@@ -683,7 +748,7 @@ class Ccsds123:
                         else:
                             k = self._code_param(sigma_acc, gamma)
                             delta = self._gpo2_decode(reader, k)
-                        q = self._unmap_index(delta, s_hat, lo, hi, theta)
+                        q = self._unmap_index(delta, s_breve, lo, hi, theta)
 
                     # Eq (41): q_z(0)=Delta is the raw residual, so the first sample of
                     # each band is reconstructed losslessly (step 1, not 2m+1).
@@ -720,6 +785,11 @@ class Ccsds123:
             raise ValueError(f"image shape {image.shape} != {(p.num_bands, p.height, p.width)}")
         header = pack_header(p)                              # bit-exact CCSDS 5.3 header
         img = image.astype(np.int64)
+        lo, hi = int(img.min()), int(img.max())
+        if lo < self.s_min or hi > self.s_max:
+            raise ValueError(
+                f"sample values span [{lo}, {hi}], outside [{self.s_min}, {self.s_max}] "
+                f"for dynamic_range={p.dynamic_range}, signed={p.signed}")
         if p.entropy_coder == "hybrid":                     # predictor -> mapped indices -> hybrid
             delta = self._run(encode=True, image=img, collect_delta=True)
             body = self._hybrid().encode(delta)

@@ -9,8 +9,8 @@ Field widths follow 5.3 exactly. Covers the parts this codec emits:
     near-lossless) + Sample Representative (table 5-12, Theta > 0)
   * Entropy Coder Metadata (table 5-13 sample-adaptive / 5-14 hybrid)
 
-Out of scope: supplementary tables, custom weight init/exponent tables, periodic
-error-limit updating, BI order.
+Out of scope: supplementary tables, custom weight init/exponent tables, and the
+block-adaptive entropy coder (parse_header rejects its coder type).
 """
 
 from __future__ import annotations
@@ -161,7 +161,10 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
     u = _BitUnpacker(data)
     # Image Metadata, Essential
     u.r(8)                                      # User-Defined Data
-    Nx = u.r(16); Ny = u.r(16); Nz = u.r(16)
+    # sizes are stored mod 2^16 (table 5-3); a field value of 0 means 65536
+    Nx = u.r(16) or (1 << 16)
+    Ny = u.r(16) or (1 << 16)
+    Nz = u.r(16) or (1 << 16)
     signed = bool(u.r(1)); u.r(1)
     large = u.r(1); drange = u.r(4)
     if large:
@@ -171,6 +174,9 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
     order_bit = u.r(1)                          # Sample Encoding Order: 0=BI, 1=BSQ
     M_field = u.r(16)                           # Sub-Frame Interleaving Depth
     u.r(2); u.r(3); ect = u.r(2); u.r(1)        # Reserved, Output Word Size, Entropy Coder Type, Reserved
+    if ect > 1:                                 # '10' block-adaptive / '11' reserved (table 5-3)
+        raise ValueError(f"unsupported Entropy Coder Type {ect} "
+                         "(only sample-adaptive (0) and hybrid (1) are implemented)")
     fc = u.r(2)                                 # Quantizer Fidelity Control Method
     u.r(2); u.r(4)                              # Reserved, Supplementary Information Table Count
 
@@ -233,7 +239,7 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
     gamma0 = u.r(3); gamma0 = gamma0 if gamma0 != 0 else 8
     if ect == 1:                                # hybrid (table 5-14)
         u.r(5)                                  # Reserved
-        k_init = 3                              # unused by the hybrid coder
+        k_init = 0                              # unused by the hybrid coder; 0 validates for any D
         entropy_coder = "hybrid"
     else:                                       # sample-adaptive (table 5-13)
         k_init = u.r(4)
@@ -246,6 +252,7 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
         num_prediction_bands=P, full=full, local_sum_type=lst, omega=omega,
         register_size=R, theta=theta, phi=phi, psi=psi,
         absolute_error_limit=abs_lim, relative_error_limit=rel_lim,
+        abs_limit_used=(fc in (1, 3)), rel_limit_used=(fc in (2, 3)),
         v_min=v_min, v_max=v_max, t_inc=t_inc,
         gamma0=gamma0, gamma_star=gamma_star, u_max=u_max, k_init=k_init,
         entropy_coder=entropy_coder,
