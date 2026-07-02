@@ -1,16 +1,16 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ccsds-123-compressor"
-version = "2.0.0"
+dynamic = ["version"]
 description = "Pure-integer CCSDS-123.0-B-2 lossless / near-lossless hyperspectral image codec"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
-    {name = "CCSDS Implementation Team"}
+    {name = "Joshua Dare-Cullen", email = "j.s.o.dare-cullen@exeter.ac.uk"}
 ]
 keywords = ["compression", "hyperspectral", "multispectral", "ccsds", "image-processing"]
 classifiers = [
@@ -42,6 +42,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "ccsds.__version__"}
 
 [tool.setuptools.package-data]
 "*" = ["*.json", "*.md", "*.txt", "*.yaml", "*.yml"]

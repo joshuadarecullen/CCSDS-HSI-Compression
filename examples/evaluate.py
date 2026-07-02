@@ -5,11 +5,11 @@ Runs the codec at lossless and a sweep of near-lossless absolute error limits an
 prints a quality table. With no --input it uses a local Indian Pines .mat if present,
 otherwise a synthetic cube, so it runs from a fresh clone.
 
-    python3 tools/evaluate.py
-    python3 tools/evaluate.py --input cube.npy --limits 0 2 4 8 16
-    python3 tools/evaluate.py --input scene.mat --mat-key data --transpose 2,0,1
-    python3 tools/evaluate.py --peak data            # PSNR vs the cube's actual peak
-    python3 tools/evaluate.py --order BI
+    python3 examples/evaluate.py
+    python3 examples/evaluate.py --input cube.npy --limits 0 2 4 8 16
+    python3 examples/evaluate.py --input scene.mat --mat-key data --transpose 2,0,1
+    python3 examples/evaluate.py --peak data            # PSNR vs the cube's actual peak
+    python3 examples/evaluate.py --order BI
 """
 import argparse
 import os

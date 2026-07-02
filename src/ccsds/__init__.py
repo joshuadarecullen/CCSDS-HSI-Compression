@@ -4,10 +4,13 @@
 and `CodecParams` are the pure-integer reference codec underneath.
 """
 
+__version__ = "2.0.0"
+
 from .core.reference_codec import Ccsds123, CodecParams
 from .codec import CCSDS123
 from .metrics import (
     calculate_psnr, calculate_mssim, calculate_spectral_angle, quality_report)
 
 __all__ = ["CCSDS123", "Ccsds123", "CodecParams",
-           "calculate_psnr", "calculate_mssim", "calculate_spectral_angle", "quality_report"]
+           "calculate_psnr", "calculate_mssim", "calculate_spectral_angle", "quality_report",
+           "__version__"]

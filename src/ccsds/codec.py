@@ -8,6 +8,8 @@ torch is used only when a tensor is passed in or requested back.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 
 from .core.reference_codec import Ccsds123, CodecParams
@@ -26,8 +28,27 @@ def _to_numpy(image) -> np.ndarray:
     return np.asarray(image)
 
 
+def _any_limit(*vals) -> bool:
+    """True if any error-limit argument requests a nonzero limit."""
+    for v in vals:
+        if isinstance(v, np.ndarray):
+            if v.any():
+                return True
+        elif isinstance(v, (list, tuple)):
+            if any(np.any(np.asarray(e)) for e in v):
+                return True
+        elif v:
+            return True
+    return False
+
+
 class CCSDS123:
-    """Lossless / near-lossless CCSDS-123.0-B-2 codec."""
+    """Lossless / near-lossless CCSDS-123.0-B-2 codec.
+
+    `lossless` defaults to None, meaning it is inferred from the error limits
+    (no limits -> lossless). Passing lossless=True together with nonzero error
+    limits is a contradiction and raises ValueError.
+    """
 
     def __init__(
         self,
@@ -36,7 +57,7 @@ class CCSDS123:
         width: int,
         dynamic_range: int = 16,
         signed: bool = False,
-        lossless: bool = True,
+        lossless: Optional[bool] = None,
         absolute_error_limit: int = 0,
         relative_error_limit: int = 0,
         num_prediction_bands: int = 3,
@@ -44,9 +65,15 @@ class CCSDS123:
         local_sum_type: str = "wide_neighbor",
         **kwargs,
     ) -> None:
-        if lossless:
-            absolute_error_limit = 0
-            relative_error_limit = 0
+        near = (_any_limit(absolute_error_limit, relative_error_limit)
+                or kwargs.get("update_period_exp", -1) >= 0)
+        if lossless is None:
+            lossless = not near
+        elif lossless and near:
+            raise ValueError(
+                "lossless=True conflicts with nonzero error limits or periodic "
+                "error-limit updating; pass lossless=False (or omit lossless) "
+                "to compress near-lossless")
         self.params = CodecParams(
             num_bands=num_bands,
             height=height,

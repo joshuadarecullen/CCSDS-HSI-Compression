@@ -39,7 +39,8 @@ _X = "X"  # escape input symbol
 
 def _load_tables():
     path = os.path.join(os.path.dirname(__file__), "annexb_tables.json")
-    raw = json.load(open(path))
+    with open(path) as f:
+        raw = json.load(f)
     code, flush = [], []
     for i in range(16):
         ci = {}
@@ -128,7 +129,8 @@ class HybridCoder:
         return G, resc
 
     def _sigma_init(self) -> int:
-        return 4 << self.g0                       # small, in [0, 2^(D+gamma0)); decoder-independent
+        # in [0, 2^(D+gamma0)) per 5.4.3.3.4.3; the min() only binds at D=2
+        return min(4 << self.g0, (1 << (self.D + self.g0)) - 1)
 
     def _high_k(self, Sigma: int, Gamma: int) -> int:
         thresh = Sigma + ((49 * Gamma) >> 5)      # Eq (66)

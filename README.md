@@ -8,9 +8,13 @@ is bit-exact by construction. The core is numpy; with [numba](https://numba.pyda
 
 ## Quick start
 
+```bash
+pip install -e .           # or ./install_dev.sh; add .[numba] for the fast path
+```
+
 ```python
 import numpy as np
-from src.ccsds import CCSDS123
+from ccsds import CCSDS123
 
 img = np.random.randint(0, 1 << 16, size=(100, 64, 64)).astype(np.int64)  # [Z, Y, X]
 
@@ -32,10 +36,13 @@ assert np.abs(img - recon).max() <= 4
 Quality metrics for near-lossless reconstructions (numpy-only: PSNR, MSSIM, SAM):
 
 ```python
-from src.ccsds import quality_report
+from ccsds import quality_report
 print(quality_report(img, recon, dynamic_range=16))
 # {'psnr_db': ..., 'mssim': ..., 'sam_rad': ..., 'max_abs_error': ...}
 ```
+
+(Running from a clean checkout without installing also works: use
+`from src.ccsds import ...` from the repo root instead.)
 
 Decode a blob without holding a configured codec, the parameters come from the
 header:
