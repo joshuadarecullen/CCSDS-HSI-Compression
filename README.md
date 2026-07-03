@@ -135,7 +135,7 @@ well ahead as the limit grows (it packs the mostly-zero residuals into sub-1-bit
 | dataset | bands | D | lossless | a=4 | a=16 | a=64 |
 |---|--:|--:|--:|--:|--:|--:|
 | washington_dc | 191 | 16 | 4.21:1 | 7.2:1 | 11.9:1 | 24.2:1 |
-| ksc | 176 | 16 | 3.26:1 | 6.4:1 | 10.0:1 | 16.1:1 |
+| ksc | 176 | 16 | 3.27:1 | 6.4:1 | 10.0:1 | 16.1:1 |
 | salinas | 204 | 14 | 2.86:1 | 7.2:1 | 18.9:1 | 54.1:1 |
 | botswana | 145 | 16 | 2.48:1 | 4.8:1 | 9.5:1 | 27.5:1 |
 | urban_r162 | 162 | 10 | 2.18:1 | 5.3:1 | 10.9:1 | 23.5:1 |
@@ -160,7 +160,9 @@ target is a 10x or larger cut in rate.
 The smoother 16-bit scenes stay at 50-60 dB there (washington_dc **56.2 dB at 0.29 bpppb**, 54.6:1;
 botswana 58.2 dB at 0.29 bpppb; ksc 52.7 dB at 0.43 bpppb), while the noisier 10-bit urban scenes
 trade down into the 20s (urban_r162 25 dB at 0.32 bpppb). Salinas holds roughly 51-56 dB across the
-band. This sweep runs the hybrid coder out to an error limit of 512.
+band. This sweep runs the hybrid coder out to an error limit of 512; the 10-bit urban
+scenes stop at 256 because the standard caps error limits at 2^min(D-1,16)-1 = 511
+(4.8.2.2), so a=512 is not representable in their headers and the benchmark skips it.
 
 Reproduce (reads `<dataset>/zarr/cube.zarr`, needs `zarr`; non-integer/normalised cubes are
 auto-skipped. Here `samson` was skipped as normalised and the 752M-sample `chikusei` by size):
