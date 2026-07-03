@@ -99,6 +99,10 @@ def main():
             print(f"[run]  {name}  shape={cube.shape}  D={D}  ({nsamp:,} samples)", flush=True)
             for coder in args.coders:
                 for lim in args.limits:
+                    if lim >= (1 << min(D - 1, 16)):
+                        print(f"    [skip] a={lim}: not representable for D={D} "
+                              f"(DA <= min(D-1,16) bits, 4.8.2.2)", flush=True)
+                        continue
                     kw = {} if lim == 0 else {"absolute_error_limit": lim}
                     codec = Ccsds123(CodecParams(
                         num_bands=Nz, height=Ny, width=Nx, dynamic_range=D,
