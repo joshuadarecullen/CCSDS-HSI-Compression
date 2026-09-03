@@ -88,7 +88,7 @@ def _kparam(sigma, gamma, D):
 def _kernel(encode, mode, delta_arr, image, body, buf, spp, recon, cdiff,
             Nz, Ny, Nx, D, P, full, lst, Omega, R, do_mod,
             Theta, phi, psi, abs_lim, rel_lim, abs_used, rel_used,
-            vmin, vmax, tinc, zinter, zintra,
+            vmin, vmax, tinc, zexp,
             gamma0, gstar_full, sigma_init, umax,
             s_min, s_max, s_mid, w_min, w_max, winit):
     pos = 0
@@ -105,7 +105,7 @@ def _kernel(encode, mode, delta_arr, image, body, buf, spp, recon, cdiff,
         for j in range(Cz):                                # default or custom (Eq 33-35)
             w[j] = winit[z, j]
         gamma = 1 << gamma0
-        sigma_acc = sigma_init
+        sigma_acc = sigma_init[z]
 
         for y in range(Ny):
             for x in range(Nx):
@@ -271,13 +271,13 @@ def _kernel(encode, mode, delta_arr, image, body, buf, spp, recon, cdiff,
                 elif s_prime > s_max:
                     s_prime = s_max
                 recon[z, y, x] = s_prime
-                if t == 0 or (phi == 0 and psi == 0):
+                if t == 0 or (phi[z] == 0 and psi[z] == 0):
                     spp[z, y, x] = s_prime
                 else:
                     sgn_q = 1 if q > 0 else (-1 if q < 0 else 0)
-                    num = (4 * ((1 << Theta) - phi)
-                           * (s_prime * (1 << Omega) - sgn_q * m * psi * (1 << (Omega - Theta)))
-                           + phi * s_tilde - phi * (1 << (Omega + 1)))
+                    num = (4 * ((1 << Theta) - phi[z])
+                           * (s_prime * (1 << Omega) - sgn_q * m * psi[z] * (1 << (Omega - Theta)))
+                           + phi[z] * s_tilde - phi[z] * (1 << (Omega + 1)))
                     sbpp = num // (1 << (Omega + Theta + 1))
                     spp[z, y, x] = (sbpp + 1) // 2
 
@@ -292,8 +292,7 @@ def _kernel(encode, mode, delta_arr, image, body, buf, spp, recon, cdiff,
                     rho = rho_t + D - Omega
                     sgn_e = 1 if e >= 0 else -1
                     for j in range(Cz):
-                        zeta = zintra if (full == 1 and j < 3) else zinter
-                        pw = rho + zeta
+                        pw = rho + zexp[z, j]
                         val = sgn_e * U[j]
                         if pw < 0:
                             inc = ((val << (-pw)) + 1) >> 1
@@ -339,19 +338,21 @@ def _setup(codec):
     cdiff = np.zeros((Nz, Ny, Nx), dtype=np.int64)
     abs_lim = _limit_array(p.absolute_error_limit, Nz)
     rel_lim = _limit_array(p.relative_error_limit, Nz)
-    kprime = p.k_init if p.k_init <= 30 - D else 2 * p.k_init + D - 30
-    sigma_init = ((3 * (1 << (kprime + 6)) - 49) * (1 << p.gamma0)) >> 7
+    sigma_init = np.array([codec._sigma_init(z) for z in range(Nz)], dtype=np.int64)
     gstar_full = (1 << p.gamma_star) - 1
     do_mod = 1 if p.register_size <= 62 else 0
     au, ru = p.fidelity_layout()[:2]
     winit = np.zeros((Nz, 3 + p.num_prediction_bands), dtype=np.int64)
+    zexp = np.zeros((Nz, 3 + p.num_prediction_bands), dtype=np.int64)
     for z in range(Nz):
-        row = codec._init_weights(z)
-        for j, v in enumerate(row):
+        for j, v in enumerate(codec._init_weights(z)):
             winit[z, j] = v
+        for j, v in enumerate(codec._zeta_row(z)):
+            zexp[z, j] = v
     args = (Nz, Ny, Nx, D, p.num_prediction_bands, 1 if p.full else 0, _LST[p.local_sum_type],
-            p.omega, p.register_size, do_mod, p.theta, p.phi, p.psi, abs_lim, rel_lim,
-            1 if au else 0, 1 if ru else 0, p.v_min, p.v_max, p.t_inc, p.zeta_inter, p.zeta_intra,
+            p.omega, p.register_size, do_mod, p.theta,
+            _limit_array(p.phi, Nz), _limit_array(p.psi, Nz), abs_lim, rel_lim,
+            1 if au else 0, 1 if ru else 0, p.v_min, p.v_max, p.t_inc, zexp,
             p.gamma0, gstar_full, sigma_init, p.u_max,
             codec.s_min, codec.s_max, codec.s_mid, codec.w_min, codec.w_max, winit)
     return spp, recon, cdiff, args
@@ -396,9 +397,7 @@ def run_numba_delta(codec, encode: bool, image=None, delta=None):
 def _bi_enc(delta, Nz, Ny, Nx, D, M, n_i, G, resc, sigma_init, umax,
             periodic, u, au, ru, da, dr, DA, DR, abs_vals, rel_vals, buf):
     pos = 0
-    sigma = np.empty(Nz, dtype=np.int64)
-    for z in range(Nz):
-        sigma[z] = sigma_init
+    sigma = sigma_init.copy()
     for y in range(Ny):
         if periodic == 1 and (y % (1 << u)) == 0:
             pi = y >> u
@@ -458,9 +457,7 @@ def _bi_enc(delta, Nz, Ny, Nx, D, M, n_i, G, resc, sigma_init, umax,
 def _bi_dec(body, Nz, Ny, Nx, D, M, n_i, G, resc, sigma_init, umax,
             periodic, u, au, ru, da, dr, DA, DR, out, got_abs, got_rel):
     pos = 0
-    sigma = np.empty(Nz, dtype=np.int64)
-    for z in range(Nz):
-        sigma[z] = sigma_init
+    sigma = sigma_init.copy()
     for y in range(Ny):
         if periodic == 1 and (y % (1 << u)) == 0:
             pi = y >> u
@@ -528,7 +525,7 @@ def _bi_setup(codec):
     G, resc = codec._gamma_seq(Ny * Nx)
     return (Nz, Ny, Nx, D, M, (Nz + M - 1) // M,
             np.array(G, np.int64), np.array([1 if r else 0 for r in resc], np.int8),
-            codec._sigma_init(), p.u_max)
+            np.array([codec._sigma_init(z) for z in range(Nz)], np.int64), p.u_max)
 
 
 def _bi_vals(period, dep, Nz, nper):

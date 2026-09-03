@@ -10,7 +10,7 @@ numpy-only.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 
@@ -129,10 +129,10 @@ class CodecParams:
     omega: int = 14                  # Omega, weight resolution (4..19)
     register_size: int = 64          # R  (max{32,D+Omega+2}..64)
 
-    # sample representatives (4.9)
+    # sample representatives (4.9); phi/psi: int or per-band list (5.3.3.5.2/3)
     theta: int = 0                   # Theta resolution (0..4)
-    phi: int = 0                     # damping phi_z (0..2^Theta-1)
-    psi: int = 0                     # offset psi_z (0..2^Theta-1, 0 if lossless)
+    phi: object = 0                  # damping phi_z (0..2^Theta-1)
+    psi: object = 0                  # offset psi_z (0..2^Theta-1, 0 if lossless)
 
     # quantizer fidelity (4.8.2); lossless => all zero. Each limit may be a single
     # int (band-independent) or a length-num_bands list (band-dependent {a_z}/{r_z}).
@@ -150,6 +150,10 @@ class CodecParams:
     t_inc: int = 64                  # power of 2 in [2^4, 2^11]
     zeta_inter: int = 0              # inter-band weight exponent offset (central comps)
     zeta_intra: int = 0              # intra-band weight exponent offset (directional comps)
+    # per-band weight exponent offsets (4.10.4), each in -6..5, in table order
+    # (5.3.3.3.3.2): [zeta*_z (full mode only)] + [zeta_z^(1..min(z,P))].
+    # None with nonzero scalar zetas above expands them per band.
+    weight_exp_offset: object = None
 
     # custom weight initialization (4.6.3.3): per-band vectors Lambda_z, each of
     # length C_z = (3 if full else 0) + min(z, P), components signed Q-bit ints.
@@ -161,10 +165,20 @@ class CodecParams:
     gamma0: int = 1                  # initial count exponent (1..8)
     gamma_star: int = 6              # rescaling counter size (max{4,gamma0+1}..11)
     u_max: int = 18                  # unary length limit (8..32)
-    k_init: Optional[int] = None     # accumulator init constant K (0..min(D-2,14)); None = min(3, D-2)
+    # accumulator init K (5.4.3.2.3.3): 0..min(D-2,14), None = min(3, D-2),
+    # or a per-band list (table 5.3.4.2.2)
+    k_init: object = None
+
+    # hybrid initial accumulators Sigma_z(0) per band (5.4.3.3.4.3): in
+    # [0, 2^(D+gamma0)), not carried in the stream; None = 4 * 2^gamma0
+    hybrid_sigma_init: object = None
 
     # entropy coder selection
     entropy_coder: str = "sample_adaptive"   # 'sample_adaptive' | 'hybrid'
+
+    # framing (5.2.2 / table 5-3)
+    user_data: int = 0               # User-Defined Data header byte
+    output_word_size: int = 1        # B: compressed image padded to a multiple of B bytes
 
     # input order (5.4.2): 'BSQ' (default) or 'BI' (band-interleaved)
     encoding_order: str = "BSQ"      # 'BSQ' | 'BI'
@@ -175,6 +189,12 @@ class CodecParams:
     update_period_exp: int = -1
     abs_bits: int = 0                # DA override (0 => derive from values); set on header parse
     rel_bits: int = 0                # DR override
+
+    # supplementary information tables (3.5): header-only metadata, no effect on
+    # the body. List of dicts {type: unsigned|signed|float, purpose, structure:
+    # 0d|1d|zx|yx, user, bit_depth (int types) or df/de/bias (float), data} with
+    # flat row-major data; float elements are raw (sign, exponent, significand).
+    supplementary_tables: object = None
 
     @staticmethod
     def _norm_limit(v):
@@ -190,10 +210,25 @@ class CodecParams:
         self.relative_error_limit = self._norm_limit(self.relative_error_limit)
         if self.k_init is None:
             self.k_init = min(3, max(0, self.dynamic_range - 2))
+        elif isinstance(self.k_init, (list, tuple, np.ndarray)):
+            self.k_init = [int(v) for v in self.k_init]
+        if isinstance(self.phi, (list, tuple, np.ndarray)):
+            self.phi = [int(v) for v in self.phi]
+        if isinstance(self.psi, (list, tuple, np.ndarray)):
+            self.psi = [int(v) for v in self.psi]
+        if self.hybrid_sigma_init is not None:
+            self.hybrid_sigma_init = [int(v) for v in self.hybrid_sigma_init]
         if self.weight_init is not None:
             self.weight_init = [[int(v) for v in row] for row in self.weight_init]
             if self.weight_init_resolution == 0:
                 self.weight_init_resolution = self.omega + 3
+        if self.weight_exp_offset is not None:
+            self.weight_exp_offset = [[int(v) for v in row] for row in self.weight_exp_offset]
+        elif self.zeta_inter or self.zeta_intra:    # expand the scalar zetas per band
+            self.weight_exp_offset = [
+                ([self.zeta_intra] if self.full else []) +
+                [self.zeta_inter] * min(z, self.num_prediction_bands)
+                for z in range(self.num_bands)]
 
     def band_components(self, z: int) -> int:
         """C_z: number of weight/local-difference components for band z (4.6.1)."""
@@ -248,24 +283,34 @@ class CodecParams:
         assert 4 <= self.omega <= 19
         assert max(32, D + self.omega + 2) <= self.register_size <= 64
         assert 0 <= self.theta <= 4
-        assert 0 <= self.phi <= (1 << self.theta) - 1
-        assert 0 <= self.psi <= (1 << self.theta) - 1
+        for f in (self.phi, self.psi):
+            if isinstance(f, list):
+                assert len(f) == self.num_bands, "per-band phi/psi need num_bands entries"
+            assert all(0 <= v <= (1 << self.theta) - 1
+                       for v in (f if isinstance(f, list) else [f]))
         if self.lossless:
-            assert self.psi == 0
+            assert not any(self.psi if isinstance(self.psi, list) else [self.psi])
         assert -6 <= self.v_min <= self.v_max <= 9
         assert (self.t_inc & (self.t_inc - 1)) == 0 and 16 <= self.t_inc <= 2048
         assert 1 <= self.gamma0 <= 8
         assert max(4, self.gamma0 + 1) <= self.gamma_star <= 11
         assert 8 <= self.u_max <= 32
-        assert 0 <= self.k_init <= min(D - 2, 14), \
+        if self.hybrid_sigma_init is not None:
+            assert len(self.hybrid_sigma_init) == self.num_bands and \
+                all(0 <= v < (1 << (D + self.gamma0)) for v in self.hybrid_sigma_init), \
+                "hybrid_sigma_init needs num_bands values in 0..2^(D+gamma0)-1"
+        assert 1 <= self.output_word_size <= 8
+        assert 0 <= self.user_data <= 255
+        ki = self.k_init if isinstance(self.k_init, list) else [self.k_init]
+        assert all(0 <= k <= min(D - 2, 14) for k in ki), \
             f"k_init {self.k_init} outside 0..min(D-2,14); use k_init=None to derive it from D"
+        if isinstance(self.k_init, list):
+            assert len(self.k_init) == self.num_bands, "per-band k_init needs num_bands entries"
         assert self.entropy_coder in ("sample_adaptive", "hybrid")
         assert self.encoding_order in ("BSQ", "BI")
         if self.encoding_order == "BI":
             M = self.interleave_depth or self.num_bands
             assert 1 <= M <= self.num_bands, "interleave_depth M must be in 1..num_bands"
-            assert self.entropy_coder == "sample_adaptive", \
-                "BI order is implemented for the sample-adaptive coder"
         if self.periodic:
             assert 0 <= self.update_period_exp <= 9, "update period exponent u must be 0..9"
             assert self.encoding_order == "BI", "periodic error-limit updating requires BI order"
@@ -323,6 +368,42 @@ class CodecParams:
                     f"weight_init[{z}] must have C_z={self.band_components(z)} components"
                 for v in row:
                     assert -half <= v < half, f"weight init component {v} not a signed {Q}-bit int"
+        assert -6 <= self.zeta_inter <= 5 and -6 <= self.zeta_intra <= 5, \
+            "weight exponent offsets must be in -6..5 (4.10.4)"
+        if self.weight_exp_offset is not None:
+            assert len(self.weight_exp_offset) == self.num_bands, \
+                "weight_exp_offset needs one vector per band"
+            for z, row in enumerate(self.weight_exp_offset):
+                n = (1 if self.full else 0) + min(z, self.num_prediction_bands)
+                assert len(row) == n, \
+                    f"weight_exp_offset[{z}] must have {n} components (intra + min(z,P) inter)"
+                for v in row:
+                    assert -6 <= v <= 5, f"weight exponent offset {v} outside -6..5 (4.10.4)"
+        if self.supplementary_tables is not None:
+            assert len(self.supplementary_tables) <= 15, \
+                "at most 15 supplementary information tables (3.5.2.1)"
+            counts = {"0d": 1, "1d": self.num_bands,
+                      "zx": self.num_bands * self.width, "yx": self.height * self.width}
+            for t in self.supplementary_tables:
+                assert t["type"] in ("unsigned", "signed", "float")
+                assert 0 <= t["purpose"] <= 15 and not 5 <= t["purpose"] <= 9, \
+                    "table purpose values 5..9 are reserved (3.5.2.2)"
+                assert 0 <= t.get("user", 0) <= 15
+                assert len(t["data"]) == counts[t["structure"]], \
+                    f"{t['structure']} table needs {counts[t['structure']]} elements"
+                if t["type"] == "float":
+                    DF, DE, beta = t["df"], t["de"], t["bias"]
+                    assert 1 <= DF <= 23 and 2 <= DE <= 8 and 0 <= beta < (1 << DE), \
+                        "float table needs 1<=DF<=23, 2<=DE<=8, 0<=bias<2^DE (3.5.2.3.3)"
+                    for b, al, j in t["data"]:
+                        assert b in (0, 1) and 0 <= al < (1 << DE) and 0 <= j < (1 << DF)
+                else:
+                    DI = t["bit_depth"]
+                    assert 1 <= DI <= 32, "integer table bit depth must be 1..32 (3.5.2.3.1)"
+                    lo, hi = ((-(1 << (DI - 1)), 1 << (DI - 1)) if t["type"] == "signed"
+                              else (0, 1 << DI))
+                    for v in t["data"]:
+                        assert lo <= v < hi, f"table element {v} not a {t['type']} {DI}-bit int"
         if self.local_sum_type not in (
             "wide_neighbor", "narrow_neighbor", "wide_column", "narrow_column"
         ):
@@ -373,6 +454,15 @@ class Ccsds123:
         if p.full:
             return [0, 0, 0] + centrals                     # [w^N, w^W, w^NW, w^(1..)]
         return centrals
+
+    # per-component weight exponent offsets zeta, j-indexed like the weights:
+    # the 3 directional components share zeta*_z (4.10.4)
+    def _zeta_row(self, z: int) -> List[int]:
+        p = self.p
+        if p.weight_exp_offset is None:
+            return [0] * p.band_components(z)
+        o = p.weight_exp_offset[z]
+        return ([o[0]] * 3 + list(o[1:])) if p.full else list(o)
 
     # local sum (Eq 20-23)
     def _local_sum(self, spp: np.ndarray, z: int, y: int, x: int) -> int:
@@ -513,29 +603,30 @@ class Ccsds123:
         return -((delta + 1) // 2) * parity
 
     # sample representative (Eq 46-48)
-    def _sample_rep(self, s_prime: int, s_tilde: int, q: int, m: int, t: int) -> int:
+    def _sample_rep(self, s_prime: int, s_tilde: int, q: int, m: int, t: int, z: int) -> int:
         p = self.p
         if t == 0:
             return s_prime                                  # s''_z(0) = s_z(0) = s'_z(0)
-        if p.phi == 0 and p.psi == 0:
+        phi = p.phi[z] if isinstance(p.phi, list) else p.phi
+        psi = p.psi[z] if isinstance(p.psi, list) else p.psi
+        if phi == 0 and psi == 0:
             return s_prime                                  # Note 2: s'' = s'
         Om, Th = p.omega, p.theta
         sgn_q = (q > 0) - (q < 0)
-        num = (4 * ((1 << Th) - p.phi)
-               * (s_prime * (1 << Om) - sgn_q * m * p.psi * (1 << (Om - Th)))
-               + p.phi * s_tilde - p.phi * (1 << (Om + 1)))                  # Eq (47) numerator
+        num = (4 * ((1 << Th) - phi)
+               * (s_prime * (1 << Om) - sgn_q * m * psi * (1 << (Om - Th)))
+               + phi * s_tilde - phi * (1 << (Om + 1)))                      # Eq (47) numerator
         s_breve_pp = num // (1 << (Om + Th + 1))            # double-resolution representative
         return (s_breve_pp + 1) // 2                        # Eq (46)
 
     # weight update (Eq 49-54)
-    def _update_weights(self, weights, U, s_prime, s_breve, t):
+    def _update_weights(self, weights, U, s_prime, s_breve, t, zrow):
         p = self.p
         e = 2 * s_prime - s_breve                           # Eq (49) double-resolution error
         rho = _clip(p.v_min + (t - p.width) // p.t_inc, p.v_min, p.v_max) + p.dynamic_range - p.omega
         sgn_e = 1 if e >= 0 else -1                         # sgn+ (Eq 7)
         for j in range(len(weights)):
-            zeta = p.zeta_intra if (p.full and j < 3) else p.zeta_inter
-            pw = rho + zeta
+            pw = rho + zrow[j]
             val = sgn_e * U[j]
             if pw < 0:
                 inc = ((val << (-pw)) + 1) >> 1
@@ -544,9 +635,9 @@ class Ccsds123:
             weights[j] = _clip(weights[j] + inc, self.w_min, self.w_max)
 
     # entropy coder statistics (5.4.3.2.3)
-    def _sigma_init(self) -> int:
+    def _sigma_init(self, z: int = 0) -> int:
         p = self.p
-        kpp = p.k_init
+        kpp = p.k_init[z] if isinstance(p.k_init, list) else p.k_init
         kprime = kpp if kpp <= 30 - p.dynamic_range else 2 * kpp + p.dynamic_range - 30   # Eq (59)
         gamma1 = 1 << p.gamma0
         return ((3 * (1 << (kprime + 6)) - 49) * gamma1) >> 7                              # Eq (58)
@@ -643,7 +734,7 @@ class Ccsds123:
         Nz, Ny, Nx, D = p.num_bands, p.height, p.width, p.dynamic_range
         M, n_i = self._bi_blocks()
         G, resc = self._gamma_seq(Ny * Nx)
-        sigma = [self._sigma_init()] * Nz
+        sigma = [self._sigma_init(z) for z in range(Nz)]
         periodic = period_abs is not None
         lay = self._limit_layout(period_abs, period_rel) if periodic else None
         w = BitWriter()
@@ -675,7 +766,7 @@ class Ccsds123:
         Nz, Ny, Nx, D = p.num_bands, p.height, p.width, p.dynamic_range
         M, n_i = self._bi_blocks()
         G, resc = self._gamma_seq(Ny * Nx)
-        sigma = [self._sigma_init()] * Nz
+        sigma = [self._sigma_init(z) for z in range(Nz)]
         r = BitReader(body)
         delta = np.zeros((Nz, Ny, Nx), dtype=np.int64)
         periodic = p.periodic
@@ -733,8 +824,9 @@ class Ccsds123:
 
         for z in range(Nz):
             weights = self._init_weights(z)
+            zrow = self._zeta_row(z)
             gamma = 1 << p.gamma0                            # Gamma(1)  (Eq 57)
-            sigma_acc = self._sigma_init()                  # Sigma_z(1) (Eq 58)
+            sigma_acc = self._sigma_init(z)                 # Sigma_z(1) (Eq 58)
             for y in range(Ny):
                 if periodic:                                # active limits for this row's period
                     al, rl = period_abs[y >> u_period], period_rel[y >> u_period]
@@ -785,11 +877,11 @@ class Ccsds123:
                     step = 1 if t == 0 else (2 * m + 1)
                     s_prime = _clip(s_hat + q * step, self.s_min, self.s_max)          # Eq (48)
                     recon[z, y, x] = s_prime
-                    spp[z, y, x] = self._sample_rep(s_prime, s_tilde, q, m, t)
+                    spp[z, y, x] = self._sample_rep(s_prime, s_tilde, q, m, t, z)
 
                     if t > 0:
                         cdiff[z, y, x] = 4 * int(spp[z, y, x]) - sigma   # cache central diff (Eq 24)
-                        self._update_weights(weights, U, s_prime, s_breve, t)
+                        self._update_weights(weights, U, s_prime, s_breve, t, zrow)
                         if not hybrid_mode and gamma < gstar_full:   # Eq (60)/(61): stats for next
                             sigma_acc += delta
                             gamma += 1
@@ -805,7 +897,8 @@ class Ccsds123:
     def _hybrid(self):
         if getattr(self, "_hybrid_coder", None) is None:          # cache (flattened tables reused)
             p = self.p
-            self._hybrid_coder = HybridCoder(p.dynamic_range, p.gamma0, p.gamma_star, p.u_max)
+            self._hybrid_coder = HybridCoder(p.dynamic_range, p.gamma0, p.gamma_star, p.u_max,
+                                             sigma_init=p.hybrid_sigma_init)
         return self._hybrid_coder
 
     def compress(self, image: np.ndarray) -> bytes:
@@ -821,8 +914,15 @@ class Ccsds123:
                 f"sample values span [{lo}, {hi}], outside [{self.s_min}, {self.s_max}] "
                 f"for dynamic_range={p.dynamic_range}, signed={p.signed}")
         if p.entropy_coder == "hybrid":                     # predictor -> mapped indices -> hybrid
-            delta = self._run(encode=True, image=img, collect_delta=True)
-            body = self._hybrid().encode(delta)
+            M = (p.interleave_depth or p.num_bands) if p.encoding_order == "BI" else 0
+            if p.periodic:
+                pa, pr, uu = self._period_arrays()
+                delta = self._run(encode=True, image=img, collect_delta=True,
+                                  period_abs=pa, period_rel=pr, u_period=uu)
+                body = self._hybrid().encode(delta, M, (uu, self._limit_layout(), pa, pr))
+            else:
+                delta = self._run(encode=True, image=img, collect_delta=True)
+                body = self._hybrid().encode(delta, M)
         elif p.encoding_order == "BI":                      # predictor -> mapped indices -> BI coder
             if p.periodic:
                 pa, pr, u = self._period_arrays()
@@ -834,14 +934,25 @@ class Ccsds123:
                 body = self._encode_bi(delta)
         else:
             body = self._run(encode=True, image=img)        # sample-adaptive, BSQ (interleaved)
-        return header + body
+        blob = header + body
+        if len(blob) % p.output_word_size:                  # fill to the output word size (5.2.2)
+            blob += bytes(p.output_word_size - len(blob) % p.output_word_size)
+        return blob
 
     def decompress(self, blob: bytes) -> np.ndarray:
         """Decode a byte string produced by compress() back to the [Z, Y, X] image."""
         p = self.p
         body = blob[parse_header(blob)[1]:]
         if p.entropy_coder == "hybrid":
-            delta = self._hybrid().decode(body, (p.num_bands, p.height, p.width))
+            M = (p.interleave_depth or p.num_bands) if p.encoding_order == "BI" else 0
+            shape = (p.num_bands, p.height, p.width)
+            if p.periodic:
+                pa0, _, uu = self._period_arrays()
+                delta, pa, pr = self._hybrid().decode(
+                    body, shape, M, (uu, self._limit_layout(), len(pa0)))
+                return self._run(encode=False, delta_in=delta,
+                                 period_abs=pa, period_rel=pr, u_period=uu)
+            delta = self._hybrid().decode(body, shape, M)
             return self._run(encode=False, delta_in=delta)
         if p.encoding_order == "BI":
             delta, pa, pr, u = self._decode_bi(body)

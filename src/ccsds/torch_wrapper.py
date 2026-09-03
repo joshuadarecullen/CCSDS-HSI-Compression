@@ -1,22 +1,12 @@
 """PyTorch wrapper for the CCSDS-123.0-B-2 reference codec.
 
-`CCSDS123Module` is an eval-only `nn.Module`: forward() compresses and
-reconstructs a [Z, Y, X] or [B, Z, Y, X] integer-valued tensor through the real
-bitstream and reports the rate, so the codec drops into a torch evaluation
-pipeline as a baseline. The codec is integer arithmetic end to end and therefore
-non-differentiable; `straight_through=True` passes gradients through the
-reconstruction unchanged (identity STE) for use inside a differentiable graph.
-
-Geometry is taken from the input shape (codecs are cached per shape); every other
-codec option (dynamic_range, error limits, predictor and coder settings) is
-passed through to `CCSDS123`. Compression runs on CPU (numba-accelerated when
-available); outputs are returned on the input's device and dtype.
-
-    module = CCSDS123Module(dynamic_range=16, absolute_error_limit=2)
-    out = module(x)          # x: [B, Z, Y, X] int tensor
-    out["reconstruction"]    # same shape/device/dtype as x
-    out["bpppb"]             # float tensor [B]
-    out["bitstreams"]        # list of B decodable byte strings
+`CCSDS123Module` is an eval-only nn.Module: forward() runs a [Z, Y, X] or
+[B, Z, Y, X] integer tensor through the real bitstream and returns
+{reconstruction, bitstreams, bits, bpppb} on the input's device/dtype.
+Non-differentiable (integer arithmetic); `straight_through=True` passes
+gradients through the reconstruction unchanged. Geometry comes from the input
+shape (codecs cached per shape); other kwargs are forwarded to `CCSDS123`.
+CPU only, and ~100x slower without numba (check `Ccsds123.use_numba`).
 """
 
 from __future__ import annotations
@@ -57,8 +47,7 @@ class CCSDS123Module(torch.nn.Module):
         if arr.is_floating_point():
             rounded = arr.round()
             if not torch.equal(rounded, arr):
-                raise ValueError("input has non-integer values; CCSDS-123 codes integer "
-                                 "samples, quantize the tensor before compressing")
+                raise ValueError("non-integer sample values; quantize before compressing")
             arr = rounded
         return arr.numpy().astype(np.int64), squeeze
 

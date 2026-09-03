@@ -4,15 +4,16 @@ Bit-exact CCSDS-123.0-B-2 compressed-image header (section 5.3).
 `pack_header(params)` -> header bytes; `parse_header(data)` -> (params, n_bytes).
 Field widths follow 5.3 exactly. Covers the parts this codec emits:
 
-  * Image Metadata, Essential subpart (table 5-3)
-  * Predictor Metadata, Primary (table 5-6) + Weight Tables (table 5-7, custom
-    weight initialization) + Quantization (tables 5-8..5-11, near-lossless) +
-    Sample Representative (table 5-12, Theta > 0)
+  * Image Metadata, Essential subpart (table 5-3) + Supplementary Information
+    Tables (table 5-4)
+  * Predictor Metadata, Primary (table 5-6) + Weight Tables (table 5-7: custom
+    weight initialization and weight exponent offsets) + Quantization (tables
+    5-8..5-11, near-lossless) + Sample Representative (table 5-12, Theta > 0)
   * Entropy Coder Metadata (table 5-13 sample-adaptive / 5-14 hybrid)
 
-Out of scope: supplementary tables, the Weight Exponent Offset Table (parse_header
-rejects its flags), and the block-adaptive entropy coder (parse_header rejects its
-coder type).
+Out of scope: the block-adaptive entropy coder and streams whose weight exponent
+offsets, accumulator init or damping/offset values are mission-defined rather
+than carried in a header table; parse_header rejects both.
 """
 
 from __future__ import annotations
@@ -21,6 +22,15 @@ from typing import Dict, Tuple
 
 _LST = {"wide_neighbor": 0, "narrow_neighbor": 1, "wide_column": 2, "narrow_column": 3}
 _LST_INV = {v: k for k, v in _LST.items()}
+_TT = {"unsigned": 0, "signed": 1, "float": 2}              # supplementary Table Type
+_TT_INV = {v: k for k, v in _TT.items()}
+_TS = {"0d": 0, "1d": 1, "zx": 2, "yx": 3}                  # supplementary Table Structure
+_TS_INV = {v: k for k, v in _TS.items()}
+
+
+def _s2c(v: int, n: int) -> int:
+    """n-bit two's complement -> signed int."""
+    return v - (1 << n) if v >= (1 << (n - 1)) else v
 
 
 class _BitPacker:
@@ -70,8 +80,6 @@ class _BitUnpacker:
 
 def pack_header(p) -> bytes:
     """Pack a CodecParams-like object into a bit-exact CCSDS 5.3 header."""
-    if p.zeta_inter or p.zeta_intra:
-        raise NotImplementedError("non-zero weight-exponent offsets need the Weight Tables subpart")
     D = p.dynamic_range
     a, r = p.absolute_error_limit, p.relative_error_limit
     au, ru, dep_a, dep_r, DA, DR = p.fidelity_layout()
@@ -81,7 +89,7 @@ def pack_header(p) -> bytes:
 
     bp = _BitPacker()
     # Image Metadata, Essential (table 5-3)
-    bp.w(0, 8)                                  # User-Defined Data
+    bp.w(getattr(p, "user_data", 0) & 0xFF, 8)  # User-Defined Data
     bp.w(p.width & 0xFFFF, 16)                  # X Size
     bp.w(p.height & 0xFFFF, 16)                 # Y Size
     bp.w(p.num_bands & 0xFFFF, 16)              # Z Size
@@ -93,12 +101,29 @@ def pack_header(p) -> bytes:
     M = (p.interleave_depth or p.num_bands) if bi else 0
     bp.w(M & 0xFFFF, 16)                         # Sub-Frame Interleaving Depth (M for BI)
     bp.w(0, 2)                                  # Reserved
-    bp.w(1 & 0x7, 3)                            # Output Word Size B=1 (byte-aligned body)
+    bp.w(getattr(p, "output_word_size", 1) & 0x7, 3)   # Output Word Size (B mod 8)
     bp.w(1 if getattr(p, "entropy_coder", "sample_adaptive") == "hybrid" else 0, 2)  # Entropy Coder Type
     bp.w(0, 1)                                  # Reserved
     bp.w(fc, 2)                                 # Quantizer Fidelity Control Method
+    tables = getattr(p, "supplementary_tables", None) or []
     bp.w(0, 2)                                  # Reserved
-    bp.w(0, 4)                                  # Supplementary Information Table Count (tau=0)
+    bp.w(len(tables) & 0xF, 4)                  # Supplementary Information Table Count tau
+
+    # Image Metadata, Supplementary Information Tables (tables 5-4, 5.3.2.3)
+    for t in tables:
+        bp.w(_TT[t["type"]], 2); bp.w(0, 2); bp.w(t["purpose"], 4)
+        bp.w(0, 1); bp.w(_TS[t["structure"]], 2); bp.w(0, 1); bp.w(t.get("user", 0), 4)
+        if t["type"] == "float":                # data subblock (5.3.2.3.2.3)
+            DF, DE = t["df"], t["de"]
+            bp.w(DF, 5); bp.w(DE & 0x7, 3); bp.w(t["bias"], DE)
+            for b, alpha, j in t["data"]:
+                bp.w(b, 1); bp.w(alpha, DE); bp.w(j, DF)
+        else:                                   # integer data subblock (5.3.2.3.2.2)
+            DI = t["bit_depth"]
+            bp.w(DI & 0x1F, 5)
+            for v in t["data"]:
+                bp.w(int(v) & ((1 << DI) - 1), DI)
+        bp.align()
 
     # Predictor Metadata, Primary (table 5-6)
     t_inc_log = p.t_inc.bit_length() - 1        # log2(t_inc)
@@ -106,7 +131,8 @@ def pack_header(p) -> bytes:
     bp.w(1 if p.theta > 0 else 0, 1)            # Sample Representative Flag
     bp.w(p.num_prediction_bands, 4)             # Number of Prediction Bands P
     bp.w(0 if p.full else 1, 1)                 # Prediction Mode
-    bp.w(0, 1)                                  # Weight Exponent Offset Flag
+    custom_z = getattr(p, "weight_exp_offset", None) is not None
+    bp.w(1 if custom_z else 0, 1)               # Weight Exponent Offset Flag
     bp.w(_LST[p.local_sum_type], 2)             # Local Sum Type
     bp.w(p.register_size & 0x3F, 6)             # Register Size (R mod 64)
     bp.w((p.omega - 4) & 0xF, 4)                # Weight Component Resolution
@@ -114,7 +140,7 @@ def pack_header(p) -> bytes:
     bp.w((p.v_min + 6) & 0xF, 4)                # Weight Update Initial Parameter
     bp.w((p.v_max + 6) & 0xF, 4)                # Weight Update Final Parameter
     custom_w = getattr(p, "weight_init", None) is not None
-    bp.w(0, 1)                                  # Weight Exponent Offset Table Flag
+    bp.w(1 if custom_z else 0, 1)               # Weight Exponent Offset Table Flag
     bp.w(1 if custom_w else 0, 1)               # Weight Initialization Method
     bp.w(1 if custom_w else 0, 1)               # Weight Initialization Table Flag
     bp.w(p.weight_init_resolution if custom_w else 0, 5)   # Weight Initialization Resolution Q
@@ -126,6 +152,11 @@ def pack_header(p) -> bytes:
         for row in p.weight_init:
             for v in row:
                 bp.w(int(v) & ((1 << Q) - 1), Q)
+        bp.align()
+    if custom_z:                                # Weight Exponent Offset Table (5.3.3.3.3):
+        for row in p.weight_exp_offset:         # [zeta*_z (full)] + zeta_z^(i), 4-bit two's comp
+            for v in row:
+                bp.w(int(v) & 0xF, 4)
         bp.align()
 
     # Predictor Metadata, Quantization subpart (near-lossless only)
@@ -148,11 +179,18 @@ def pack_header(p) -> bytes:
                     bp.w(int(v), DR)
                 bp.align()
 
-    # Predictor Metadata, Sample Representative subpart (Theta > 0)
+    # Predictor Metadata, Sample Representative subpart (table 5-12)
     if p.theta > 0:
         bp.w(0, 5); bp.w(p.theta, 3)                                    # Reserved + Theta
-        bp.w(0, 1); bp.w(0, 1); bp.w(0, 1); bp.w(0, 1); bp.w(p.phi, 4)  # damping (band-indep)
-        bp.w(0, 1); bp.w(0, 1); bp.w(0, 1); bp.w(0, 1); bp.w(p.psi, 4)  # offset (band-indep)
+        for f in (p.phi, p.psi):                # damping then offset: flags + fixed value
+            bv = isinstance(f, list)
+            bp.w(0, 1); bp.w(1 if bv else 0, 1); bp.w(1 if bv else 0, 1); bp.w(0, 1)
+            bp.w(0 if bv else f, 4)
+        for f in (p.phi, p.psi):                # Damping/Offset Table subblocks (5.3.3.5.2/3)
+            if isinstance(f, list):
+                for v in f:
+                    bp.w(int(v), p.theta)
+                bp.align()
 
     # Entropy Coder Metadata (table 5-13 sample-adaptive / 5-14 hybrid)
     bp.w(p.u_max & 0x1F, 5)                     # Unary Length Limit (Umax mod 32)
@@ -161,8 +199,12 @@ def pack_header(p) -> bytes:
     if getattr(p, "entropy_coder", "sample_adaptive") == "hybrid":
         bp.w(0, 5)                              # Reserved (table 5-14)
     else:
-        bp.w(p.k_init & 0xF, 4)                 # Accumulator Initialization Constant K
-        bp.w(0, 1)                              # Accumulator Initialization Table Flag
+        table = isinstance(p.k_init, list)      # Accumulator Initialization Table (5.3.4.2.2)
+        bp.w(15 if table else p.k_init & 0xF, 4)   # Accumulator Initialization Constant K
+        bp.w(1 if table else 0, 1)              # Accumulator Initialization Table Flag
+        if table:
+            for k in p.k_init:
+                bp.w(int(k) & 0xF, 4)
 
     bp.align()
     return bp.to_bytes()
@@ -172,7 +214,7 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
     """Parse a CCSDS 5.3 header. Returns (CodecParams kwargs, header length in bytes)."""
     u = _BitUnpacker(data)
     # Image Metadata, Essential
-    u.r(8)                                      # User-Defined Data
+    user_data = u.r(8)                          # User-Defined Data
     # sizes are stored mod 2^16 (table 5-3); a field value of 0 means 65536
     Nx = u.r(16) or (1 << 16)
     Ny = u.r(16) or (1 << 16)
@@ -185,12 +227,36 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
         D = drange if drange != 0 else 16
     order_bit = u.r(1)                          # Sample Encoding Order: 0=BI, 1=BSQ
     M_field = u.r(16)                           # Sub-Frame Interleaving Depth
-    u.r(2); u.r(3); ect = u.r(2); u.r(1)        # Reserved, Output Word Size, Entropy Coder Type, Reserved
+    u.r(2); B = u.r(3) or 8; ect = u.r(2); u.r(1)   # Reserved, Output Word Size, Entropy Coder Type, Reserved
     if ect > 1:                                 # '10' block-adaptive / '11' reserved (table 5-3)
         raise ValueError(f"unsupported Entropy Coder Type {ect} "
                          "(only sample-adaptive (0) and hybrid (1) are implemented)")
     fc = u.r(2)                                 # Quantizer Fidelity Control Method
-    u.r(2); u.r(4)                              # Reserved, Supplementary Information Table Count
+    u.r(2); tau = u.r(4)                        # Reserved, Supplementary Information Table Count
+
+    # Image Metadata, Supplementary Information Tables (table 5-4)
+    tables = []
+    for _ in range(tau):
+        tt = u.r(2)
+        if tt > 2:
+            raise ValueError("reserved supplementary table type '11'")
+        ttype = _TT_INV[tt]
+        u.r(2); purpose = u.r(4)
+        u.r(1); struct = _TS_INV[u.r(2)]; u.r(1); user = u.r(4)
+        n = {"0d": 1, "1d": Nz, "zx": Nz * Nx, "yx": Ny * Nx}[struct]
+        t = dict(type=ttype, purpose=purpose, structure=struct, user=user)
+        if ttype == "float":
+            DF = u.r(5); DE = u.r(3) or 8
+            t["df"], t["de"], t["bias"] = DF, DE, u.r(DE)
+            t["data"] = [(u.r(1), u.r(DE), u.r(DF)) for _ in range(n)]
+        else:
+            DI = u.r(5) or 32
+            t["bit_depth"] = DI
+            t["data"] = [u.r(DI) for _ in range(n)]
+            if ttype == "signed":
+                t["data"] = [_s2c(v, DI) for v in t["data"]]
+        u.align()
+        tables.append(t)
 
     # Predictor Metadata, Primary
     u.r(1)                                      # Reserved
@@ -208,9 +274,12 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
     custom_w = u.r(1) == 1                      # Weight Initialization Method
     w_table_flag = u.r(1)                       # Weight Initialization Table Flag
     Q = u.r(5)                                  # Weight Initialization Resolution
-    if offset_flag or offset_table_flag:
+    if offset_flag and not offset_table_flag:
         raise NotImplementedError(
-            "nonzero weight exponent offsets / Weight Exponent Offset Table are not supported")
+            "nonzero weight exponent offsets without a Weight Exponent Offset Table "
+            "cannot be decoded (offsets are mission-defined)")
+    if offset_table_flag and not offset_flag:
+        raise ValueError("Weight Exponent Offset Table present without the offset flag")
 
     # Weight Tables subpart (custom weight initialization vectors)
     weight_init = None
@@ -218,12 +287,19 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
         if not w_table_flag:
             raise ValueError("custom weight initialization without a Weight Initialization "
                              "Table in the header cannot be decoded (vectors are mission-defined)")
-        def _signed(v: int, n: int) -> int:
-            return v - (1 << n) if v >= (1 << (n - 1)) else v
         weight_init = []
         for z in range(Nz):
             cz = (3 if full else 0) + min(z, P)
-            weight_init.append([_signed(u.r(Q), Q) for _ in range(cz)])
+            weight_init.append([_s2c(u.r(Q), Q) for _ in range(cz)])
+        u.align()
+
+    # Weight Exponent Offset Table (5.3.3.3.3): [zeta*_z (full)] + zeta_z^(1..min(z,P))
+    weight_exp_offset = None
+    if offset_table_flag:
+        weight_exp_offset = []
+        for z in range(Nz):
+            n = (1 if full else 0) + min(z, P)
+            weight_exp_offset.append([_s2c(u.r(4), 4) for _ in range(n)])
         u.align()
 
     # Quantization subpart
@@ -258,12 +334,25 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
                 rel_lim = [u.r(DR) for _ in range(Nz)] if band_dep else u.r(DR)
                 u.align()
 
-    # Sample Representative subpart
+    # Sample Representative subpart (table 5-12)
     theta, phi, psi = 0, 0, 0
     if sample_rep_flag:
         u.r(5); theta = u.r(3)
-        u.r(1); u.r(1); u.r(1); u.r(1); phi = u.r(4)
-        u.r(1); u.r(1); u.r(1); u.r(1); psi = u.r(4)
+        u.r(1); bv_phi = u.r(1); tf_phi = u.r(1); u.r(1); phi = u.r(4)
+        u.r(1); bv_psi = u.r(1); tf_psi = u.r(1); u.r(1); psi = u.r(4)
+        for tag, bv, tf in (("damping", bv_phi, tf_phi), ("offset", bv_psi, tf_psi)):
+            if tf and not bv:
+                raise ValueError(f"{tag} table present without the band-varying flag")
+            if bv and not tf:
+                raise NotImplementedError(
+                    f"band-varying {tag} without a table cannot be decoded "
+                    "(values are mission-defined)")
+        if tf_phi:                              # Damping Table subblock (5.3.3.5.2)
+            phi = [u.r(theta) for _ in range(Nz)]
+            u.align()
+        if tf_psi:                              # Offset Table subblock (5.3.3.5.3)
+            psi = [u.r(theta) for _ in range(Nz)]
+            u.align()
 
     # Entropy Coder Metadata
     u_max = u.r(5); u_max = u_max if u_max >= 8 else 32
@@ -275,7 +364,15 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
         entropy_coder = "hybrid"
     else:                                       # sample-adaptive (table 5-13)
         k_init = u.r(4)
-        u.r(1)                                  # Accumulator Initialization Table Flag
+        if u.r(1):                              # Accumulator Initialization Table Flag
+            if k_init != 15:
+                raise ValueError("Accumulator Initialization Table alongside a constant K")
+            k_init = [u.r(4) for _ in range(Nz)]
+            u.align()
+        elif k_init == 15:
+            raise NotImplementedError(
+                "accumulator initialization without a table cannot be decoded "
+                "(per-band values are mission-defined)")
         entropy_coder = "sample_adaptive"
 
     u.align()
@@ -284,11 +381,13 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
         num_prediction_bands=P, full=full, local_sum_type=lst, omega=omega,
         register_size=R, theta=theta, phi=phi, psi=psi,
         weight_init=weight_init, weight_init_resolution=(Q if custom_w else 0),
+        weight_exp_offset=weight_exp_offset, supplementary_tables=(tables or None),
         absolute_error_limit=abs_lim, relative_error_limit=rel_lim,
         abs_limit_used=(fc in (1, 3)), rel_limit_used=(fc in (2, 3)),
         v_min=v_min, v_max=v_max, t_inc=t_inc,
         gamma0=gamma0, gamma_star=gamma_star, u_max=u_max, k_init=k_init,
         entropy_coder=entropy_coder,
+        user_data=user_data, output_word_size=B,
         encoding_order=("BI" if bi else "BSQ"),
         interleave_depth=(M_field if bi else 0),
         update_period_exp=u_exp, abs_bits=abs_bits, rel_bits=rel_bits,
