@@ -376,6 +376,50 @@ def test_package_imports_without_torch():
     print(f"  package import via src.ccsds.CCSDS123 + round-trip: OK (torch present={has_torch})")
 
 
+def test_torch_wrapper():
+    """CCSDS123Module: batched round-trip through the real bitstream, rate
+    reporting, near-lossless bound, and the straight-through gradient path."""
+    try:
+        import torch
+    except ImportError:
+        _skip("torch not available in this interpreter")
+        return
+    sys.path.insert(0, os.path.join(REPO, "src"))
+    from ccsds.torch_wrapper import CCSDS123Module
+
+    img = np.stack([cube(6, 16, 16, seed=s) for s in (0, 1)])   # [B, Z, Y, X]
+    x = torch.from_numpy(img)
+    m = CCSDS123Module(dynamic_range=16)
+    out = m(x)
+    rec = out["reconstruction"]
+    assert rec.shape == x.shape and rec.dtype == x.dtype
+    assert torch.equal(rec, x), "lossless torch round-trip failed"
+    assert out["bits"].tolist() == [len(b) * 8 for b in out["bitstreams"]]
+    assert torch.allclose(out["bpppb"], out["bits"].double() / img[0].size)
+    # blobs are self-contained: static decode matches, on the requested dtype
+    dec = CCSDS123Module.decompress(out["bitstreams"], dtype=x.dtype)
+    assert torch.equal(dec, x)
+    # unbatched input keeps its rank
+    assert m(x[0])["reconstruction"].shape == x[0].shape
+    # near-lossless bound holds through the wrapper
+    m2 = CCSDS123Module(dynamic_range=16, absolute_error_limit=3)
+    err = (m2(x)["reconstruction"] - x).abs().max().item()
+    assert 0 < err <= 3, f"near-lossless error {err} outside (0, 3]"
+    # integral float input works; fractional input is rejected
+    xf = x.float()
+    assert torch.equal(m(xf)["reconstruction"], xf)
+    if not _raises(ValueError, m, xf + 0.5):
+        raise AssertionError("fractional input must be rejected")
+    # straight-through: gradients pass as identity, values are the codec's
+    xg = x.float().requires_grad_(True)
+    out_st = CCSDS123Module(dynamic_range=16, absolute_error_limit=3,
+                            straight_through=True)(xg)
+    assert not torch.equal(out_st["reconstruction"].detach(), xg.detach())
+    out_st["reconstruction"].sum().backward()
+    assert torch.equal(xg.grad, torch.ones_like(xg)), "STE gradient must be identity"
+    print("  torch wrapper: batched lossless + near-lossless, static decode, STE grad OK")
+
+
 def test_metrics():
     """numpy quality metrics (PSNR/MSSIM/SAM): exact match is the ceiling, error degrades them."""
     import importlib.util as ilu
