@@ -1,23 +1,18 @@
 """Cross-validate this encoder against the NTNU CCSDS-123.0-B-2 high-level model.
 
 The NTNU model (github.com/NTNU-SmallSat-Lab/ccsds123_issue_2_verification_model,
-MIT) is an independent Python implementation that was itself verified against the
-official CCSDS test vector set Test1-20190201, so byte-identical streams here tie
-this codec to the official vectors transitively.
-
-For each config: compress with this codec, write the image as a raw BSQ file plus
-our packed CCSDS header as the NTNU settings file, run the NTNU compressor, and
-compare full bitstreams byte-for-byte. The hybrid coder's initial accumulator is
-user-specified by the standard (5.4.3.3.4.3) and not carried in the stream, so it
-is passed to the NTNU tool explicitly via --accu to match our choice.
+MIT) is an independent implementation verified against the official CCSDS vector
+set Test1-20190201. Per config: compress here, write the image as raw BSQ plus
+our packed header as the NTNU settings file, run the NTNU compressor, diff the
+bitstreams byte-for-byte. The hybrid initial accumulator is user-specified
+(5.4.3.3.4.3) and not carried in the stream, so it is passed via --accu.
 
 Usage:
     git clone https://github.com/NTNU-SmallSat-Lab/ccsds123_issue_2_verification_model
     pip install bitarray psutil
     python3 tools/crossval_ntnu.py path/to/ccsds123_issue_2_verification_model
 
-Config names must not contain 'x' or '-' (the NTNU tool parses dimensions and
-sample format out of the file name).
+Config names must not contain 'x' or '-' (NTNU parses dims from the file name).
 """
 import argparse
 import os
@@ -36,17 +31,31 @@ from synthetic_hsi import make_synthetic_hsi                   # noqa: E402
 
 
 def accu_bytes(p: CodecParams) -> bytes:
-    """Our hybrid initial accumulators (4 * 2^gamma0 per band, HybridCoder._sigma_init),
-    D+gamma0 bits each, MSB-first, zero-padded to a byte."""
+    """Sigma_z(0) for the NTNU --accu file (5.4.3.3.4.3): hybrid_sigma_init or
+    the 4*2^gamma0 default, D+gamma0 bits each, MSB-first, byte-padded."""
     nbits = p.dynamic_range + p.gamma0
-    val = min(4 << p.gamma0, (1 << nbits) - 1)
+    default = min(4 << p.gamma0, (1 << nbits) - 1)
+    vals = p.hybrid_sigma_init or [default] * p.num_bands
     bits = []
-    for _ in range(p.num_bands):
-        bits.extend((val >> (nbits - 1 - b)) & 1 for b in range(nbits))
+    for val in vals:
+        bits.extend((int(val) >> (nbits - 1 - b)) & 1 for b in range(nbits))
     while len(bits) % 8:
         bits.append(0)
     return bytes(sum(bit << (7 - i) for i, bit in enumerate(bits[k:k + 8]))
                  for k in range(0, len(bits), 8))
+
+
+def limits_bytes(p: CodecParams) -> bytes:
+    """Periodic error-limit values for the NTNU --error_limits file: per period,
+    the abs then rel values (1 or Nz each), 16-bit big-endian."""
+    au, ru, da, dr, _, _ = p.fidelity_layout()
+    out = []
+    nper = (p.height + (1 << p.update_period_exp) - 1) >> p.update_period_exp
+    for pp in range(nper):
+        for used, dep, lim in ((au, da, p.absolute_error_limit), (ru, dr, p.relative_error_limit)):
+            if used:
+                out.extend(lim[pp] if dep else [lim[pp]])
+    return b"".join(int(v).to_bytes(2, "big") for v in out)
 
 
 def run_one(ntnu: str, work: str, name: str, img: np.ndarray, params: CodecParams) -> str:
@@ -64,6 +73,11 @@ def run_one(ntnu: str, work: str, name: str, img: np.ndarray, params: CodecParam
         with open(accu_path, "wb") as f:
             f.write(accu_bytes(params))
         cmd += ["--accu", accu_path]
+    if params.periodic:
+        lim_path = os.path.join(work, f"{name}.limits.bin")
+        with open(lim_path, "wb") as f:
+            f.write(limits_bytes(params))
+        cmd += ["--error_limits", lim_path]
     r = subprocess.run(cmd, cwd=ntnu, capture_output=True, text=True, timeout=3600)
     out_bin = os.path.join(ntnu, "output", "z-output-bitstream.bin")
     if r.returncode != 0 or not os.path.exists(out_bin):
@@ -120,6 +134,39 @@ def main() -> int:
                for z in range(base["num_bands"])]
         configs.append((name, img, dict(**base, full=full, weight_init=lam,
                                         weight_init_resolution=Q)))
+    for name, full in [("zetatab_full", True), ("zetatab_reduced", False)]:
+        p0 = CodecParams(**base, full=full)
+        zoff = [[int(wrng.integers(-6, 6)) for _ in range((1 if full else 0) + min(z, p0.num_prediction_bands))]
+                for z in range(base["num_bands"])]
+        configs.append((name, img, dict(**base, full=full, weight_exp_offset=zoff)))
+    supp = [dict(type="unsigned", purpose=2, structure="1d", bit_depth=12,
+                 data=[500 + 7 * z for z in range(base["num_bands"])]),
+            dict(type="float", purpose=10, structure="0d", df=10, de=5, bias=15,
+                 data=[(0, 17, 300)])]
+    configs.append(("supptab", img, dict(**base, supplementary_tables=supp)))
+    # per-band accumulator init table (5.3.4.2.2), hybrid BI, periodic updating
+    ktab = [int(wrng.integers(0, 13)) for _ in range(base["num_bands"])]
+    configs += [
+        ("accinit", img, dict(**base, k_init=ktab)),
+        ("accinit_bil", img, dict(**base, k_init=ktab, encoding_order="BI",
+                                  interleave_depth=1, absolute_error_limit=2)),
+        ("hybrid_bip", img, dict(**base, entropy_coder="hybrid", encoding_order="BI")),
+        ("hybrid_bil_abs2", img, dict(**base, entropy_coder="hybrid", encoding_order="BI",
+                                      interleave_depth=1, absolute_error_limit=2)),
+        ("periodic_sa", img, dict(**base, encoding_order="BI", interleave_depth=2,
+                                  update_period_exp=2, absolute_error_limit=[1, 3, 0, 2, 1],
+                                  relative_error_limit=[[16, 8, 24, 4, 12]] * 5)),
+        ("periodic_hybrid", img, dict(**base, entropy_coder="hybrid", encoding_order="BI",
+                                      update_period_exp=3, absolute_error_limit=[2, 0, 1])),
+        ("bandrep", img, dict(**base, theta=2, phi=[z % 4 for z in range(5)],
+                              psi=[(z + 1) % 4 for z in range(5)], absolute_error_limit=3)),
+        ("hybaccu", img, dict(**base, entropy_coder="hybrid", encoding_order="BI",
+                              interleave_depth=2,
+                              hybrid_sigma_init=[(37 * z + 5) % (1 << 15) for z in range(5)])),
+        ("wordsize", img, dict(**base, output_word_size=3, user_data=165)),
+        ("wordsize_hyb", img, dict(**base, output_word_size=5, user_data=9,
+                                   entropy_coder="hybrid")),
+    ]
 
     results = {}
     with tempfile.TemporaryDirectory(prefix="ccsds_crossval_") as work:

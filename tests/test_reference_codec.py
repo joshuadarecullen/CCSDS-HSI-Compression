@@ -297,6 +297,12 @@ def test_numba_byte_identical():
         dict(num_prediction_bands=3, full=True, theta=2, phi=1, psi=2, absolute_error_limit=4),
         dict(num_prediction_bands=2, full=True, weight_init_resolution=5,
              weight_init=[[3, -7, 12] + [-9, 4][:min(z, 2)] for z in range(20)]),
+        dict(num_prediction_bands=4, full=True,
+             weight_exp_offset=[[(z + i) % 12 - 6 for i in range(1 + min(z, 4))]
+                                for z in range(20)]),
+        dict(num_prediction_bands=3, full=True, k_init=[(3 * z) % 13 for z in range(20)]),
+        dict(num_prediction_bands=3, full=True, theta=2, phi=[z % 4 for z in range(20)],
+             psi=[(z + 1) % 4 for z in range(20)], absolute_error_limit=3),
     ]
     for kw in configs:
         p = CodecParams(num_bands=20, height=24, width=24, dynamic_range=16, **kw)
@@ -307,7 +313,8 @@ def test_numba_byte_identical():
         dn = Ccsds123(p)
         dp = Ccsds123(p); dp.use_numba = False
         assert np.array_equal(dn.decompress(cp.compress(img)), dp.decompress(cn.compress(img)))
-    print("  numba kernel BYTE-IDENTICAL to pure-Python reference (6 configs) + cross-decode OK")
+    print(f"  numba kernel BYTE-IDENTICAL to pure-Python reference ({len(configs)} configs) "
+          "+ cross-decode OK")
 
 
 def test_hybrid_codec():
@@ -343,12 +350,13 @@ def test_hybrid_numba_identical():
     for shp in [(8, 16, 16), (20, 24, 24)]:
         for hi in [3, 100, 1 << 16]:
             d = rng.integers(0, hi, shp).astype(np.int64)
-            hc.use_numba = True;  bn = hc.encode(d); on = hc.decode(bn, shp)
-            hc.use_numba = False; bp = hc.encode(d); op = hc.decode(bp, shp)
-            hc.use_numba = True
-            assert bn == bp, f"hybrid numba encode differs from pure-Python for {shp}, {hi}"
-            assert np.array_equal(on, d) and np.array_equal(op, d) and np.array_equal(on, op)
-    print("  hybrid numba kernels BYTE-IDENTICAL to pure-Python + round-trip OK")
+            for M in (0, 1, 5):                 # BSQ, BIL, intermediate BI depth
+                hc.use_numba = True;  bn = hc.encode(d, M); on = hc.decode(bn, shp, M)
+                hc.use_numba = False; bp = hc.encode(d, M); op = hc.decode(bp, shp, M)
+                hc.use_numba = True
+                assert bn == bp, f"hybrid numba encode differs from pure-Python for {shp}, {hi}, M={M}"
+                assert np.array_equal(on, d) and np.array_equal(op, d) and np.array_equal(on, op)
+    print("  hybrid numba kernels BYTE-IDENTICAL to pure-Python + round-trip OK (BSQ + BI)")
 
 
 def test_package_imports_without_torch():
@@ -478,6 +486,38 @@ def test_periodic_error_limits():
           f"every period bound respected  ratio={st['ratio']:.3f}:1")
 
 
+def test_hybrid_bi():
+    """Hybrid coder under BI encoding order (5.4.2.2 + 5.4.3.3), including periodic
+    error-limit updating with the limits carried in the body (5.4.3.3.5.1.1)."""
+    img = cube(12, 16, 16)
+    Nz, Ny, Nx = img.shape
+    bodies = set()
+    for M in (0, Nz, 1, 4):                      # BSQ then BIP/BIL/intermediate
+        kw = dict(encoding_order="BI", interleave_depth=M) if M else {}
+        p = CodecParams(num_bands=Nz, height=Ny, width=Nx, dynamic_range=16,
+                        entropy_coder="hybrid", **kw)
+        blob = Ccsds123(p).compress(img)
+        assert np.array_equal(img, Ccsds123.decompress_standalone(blob)), \
+            f"hybrid BI M={M} lossless round-trip failed"
+        bodies.add(blob[rc.parse_header(blob)[1]:])
+    assert len(bodies) == 4, "BSQ/BIP/BIL/M=4 hybrid bodies must all differ"
+    out, _ = _roundtrip(img, entropy_coder="hybrid", encoding_order="BI",
+                        interleave_depth=Nz, absolute_error_limit=4)
+    err = int(np.abs(img - out).max())
+    assert err <= 4, f"hybrid BI near-lossless error {err} exceeds 4"
+    u = 1
+    abs_bi = [p % 5 for p in range((Ny + 1) >> 1)]
+    rel_bd = [[8 * ((z + p) % 3 + 1) for z in range(Nz)] for p in range((Ny + 1) >> 1)]
+    out2, st = _roundtrip(img, entropy_coder="hybrid", encoding_order="BI", interleave_depth=1,
+                          update_period_exp=u, absolute_error_limit=abs_bi,
+                          relative_error_limit=rel_bd)
+    for y in range(Ny):
+        e = int(np.abs(img[:, y, :] - out2[:, y, :]).max())
+        assert e <= abs_bi[y >> u], f"row {y} (period {y >> u}): err {e} > {abs_bi[y >> u]}"
+    print(f"  hybrid BI (BIP/BIL/M=4) + periodic abs+rel limits: every bound respected  "
+          f"ratio={st['ratio']:.3f}:1")
+
+
 def test_bi_numba_identical():
     """The numba BI sample-adaptive coder must be byte-identical to the pure-Python one."""
     if not getattr(rc, "NUMBA_OK", False):
@@ -497,6 +537,7 @@ def test_bi_numba_identical():
              absolute_error_limit=[[(z + p) % 4 for z in range(Nz)] for p in range(nper2)]),  # band-dep
         dict(interleave_depth=Nz, update_period_exp=2,
              relative_error_limit=[32 * (p + 1) for p in range(nper2)]),        # periodic relative
+        dict(interleave_depth=2, k_init=[(3 * z) % 11 for z in range(Nz)]),     # per-band acc init
     ]
     for kw in configs:
         p = CodecParams(num_bands=Nz, height=Ny, width=Nx, dynamic_range=16,
@@ -566,6 +607,178 @@ def test_custom_weight_init():
                     weight_init=[[], [-17]], weight_init_resolution=16)
     assert Ccsds123(p)._init_weights(1) == [-17]
     print("  custom weight init: full+reduced round-trips, header table, Eq 35 bit layout OK")
+
+
+def test_weight_exp_offset():
+    """Per-band weight exponent offsets (4.10.4) + Weight Exponent Offset Table
+    (5.3.3.3.3): offsets alter the stream, survive the header, decode standalone."""
+    img = cube(8, 20, 20)
+    for full in (True, False):
+        zoff = [[(z + i) % 12 - 6 for i in range((1 if full else 0) + min(z, 3))]
+                for z in range(8)]
+        p = CodecParams(num_bands=8, height=20, width=20, dynamic_range=16,
+                        num_prediction_bands=3, full=full, weight_exp_offset=zoff)
+        blob = Ccsds123(p).compress(img)
+        assert np.array_equal(img, Ccsds123.decompress_standalone(blob)), \
+            f"weight exponent offset round-trip failed (full={full})"
+        parsed, _ = rc.parse_header(blob)
+        assert parsed["weight_exp_offset"] == zoff, \
+            "offset table did not survive the header round-trip"
+        p0 = CodecParams(num_bands=8, height=20, width=20, dynamic_range=16,
+                         num_prediction_bands=3, full=full)
+        assert blob != Ccsds123(p0).compress(img), "offsets did not change the stream"
+    # scalar zetas are a band-independent convenience for the same table
+    ps = CodecParams(num_bands=8, height=20, width=20, dynamic_range=16,
+                     num_prediction_bands=3, zeta_inter=3, zeta_intra=-2)
+    pt = CodecParams(num_bands=8, height=20, width=20, dynamic_range=16,
+                     num_prediction_bands=3,
+                     weight_exp_offset=[[-2] + [3] * min(z, 3) for z in range(8)])
+    assert Ccsds123(ps).compress(img) == Ccsds123(pt).compress(img)
+    # offset flag without a table is mission-defined and must be rejected loudly
+    hdr = bytearray(rc.pack_header(pt))
+    hdr[16] &= 0x7F                             # clear the Offset Table Flag (byte 16 MSB)
+    assert _raises(NotImplementedError, rc.parse_header, bytes(hdr)), \
+        "offset flag without table must not parse"
+    assert _raises(AssertionError, Ccsds123, CodecParams(
+        num_bands=2, height=4, width=4, weight_exp_offset=[[7], [7, 0, 0, 0]]))
+    print("  weight exponent offsets: full+reduced round-trips, header table, scalar equiv OK")
+
+
+def test_supplementary_tables():
+    """Supplementary information tables (3.5, tables 5-4): all types and
+    structures must survive the header and leave the body untouched."""
+    Z, Y, X = 4, 6, 5
+    img = cube(Z, Y, X)
+    tables = [
+        dict(type="unsigned", purpose=2, structure="1d", bit_depth=14,
+             data=[400 + 3 * z for z in range(Z)]),
+        dict(type="signed", purpose=1, structure="0d", bit_depth=9, data=[-100]),
+        dict(type="unsigned", purpose=4, structure="yx", bit_depth=1,
+             data=[(y ^ x) & 1 for y in range(Y) for x in range(X)]),
+        dict(type="signed", purpose=15, structure="zx", bit_depth=32,
+             data=[(z * X + x) * 12345 - (1 << 30) for z in range(Z) for x in range(X)]),
+        dict(type="float", purpose=10, structure="1d", user=5, df=10, de=5, bias=15,
+             data=[(z & 1, 12 + z, 700 + z) for z in range(Z)]),
+        dict(type="float", purpose=0, structure="0d", df=23, de=8, bias=127,
+             data=[(1, 255, 1)]),               # DE=8 packs mod 8; element is a raw NaN
+    ]
+    p = CodecParams(num_bands=Z, height=Y, width=X, dynamic_range=16,
+                    supplementary_tables=tables)
+    blob = Ccsds123(p).compress(img)
+    assert np.array_equal(img, Ccsds123.decompress_standalone(blob))
+    parsed, _ = rc.parse_header(blob)
+    got = parsed["supplementary_tables"]
+    assert len(got) == len(tables)
+    for a, b in zip(got, tables):
+        for k in b:
+            assert a[k] == b[k], f"table field {k}: {a[k]} != {b[k]}"
+    # header-only: the body must be identical with and without tables
+    p0 = CodecParams(num_bands=Z, height=Y, width=X, dynamic_range=16)
+    blob0 = Ccsds123(p0).compress(img)
+    n = rc.parse_header(blob)[1]
+    n0 = rc.parse_header(blob0)[1]
+    assert blob[n:] == blob0[n0:], "supplementary tables must not touch the body"
+    # limits: reserved purpose values and tau > 15 must be rejected
+    bad = dict(type="unsigned", purpose=7, structure="0d", bit_depth=4, data=[1])
+    assert _raises(AssertionError, Ccsds123, CodecParams(
+        num_bands=Z, height=Y, width=X, supplementary_tables=[bad]))
+    ok = dict(type="unsigned", purpose=0, structure="0d", bit_depth=4, data=[1])
+    assert _raises(AssertionError, Ccsds123, CodecParams(
+        num_bands=Z, height=Y, width=X, supplementary_tables=[ok] * 16))
+    print("  supplementary tables: 6 tables (u/s/float, 0d/1d/zx/yx) header round-trip OK")
+
+
+def test_accumulator_init_table():
+    """Per-band accumulator init (5.4.3.2.3.3 + table 5.3.4.2.2): k''_z alter the
+    stream, survive the header, decode standalone; K=15 without a table rejects."""
+    img = cube(8, 20, 20)
+    ktab = [(3 * z) % 13 for z in range(8)]
+    base = dict(num_bands=8, height=20, width=20, dynamic_range=16)
+    for kw in (dict(), dict(encoding_order="BI", interleave_depth=2)):
+        p = CodecParams(**base, k_init=ktab, **kw)
+        blob = Ccsds123(p).compress(img)
+        assert np.array_equal(img, Ccsds123.decompress_standalone(blob)), \
+            f"accumulator init table round-trip failed ({kw or 'BSQ'})"
+        assert rc.parse_header(blob)[0]["k_init"] == ktab
+        assert blob != Ccsds123(CodecParams(**base, **kw)).compress(img), \
+            "per-band k_init did not change the stream"
+    # an equal-valued table changes only the header, never the body
+    bt = Ccsds123(CodecParams(**base, k_init=[5] * 8)).compress(img)
+    bc = Ccsds123(CodecParams(**base, k_init=5)).compress(img)
+    assert bt[rc.parse_header(bt)[1]:] == bc[rc.parse_header(bc)[1]:]
+    # last header byte holds gamma0(3) K(4) table-flag(1) (table 5-13)
+    hdr = bytearray(rc.pack_header(CodecParams(**base, k_init=5)))
+    hdr[-1] |= 0x01                             # table flag alongside a constant K
+    assert _raises(ValueError, rc.parse_header, bytes(hdr))
+    hdr[-1] = (hdr[-1] & 0xE0) | 0x1E           # K=15 with no table
+    assert _raises(NotImplementedError, rc.parse_header, bytes(hdr))
+    assert _raises(AssertionError, Ccsds123, CodecParams(**base, k_init=[15] * 8))
+    assert _raises(AssertionError, Ccsds123, CodecParams(**base, k_init=[3, 3]))
+    print("  accumulator init table: BSQ+BI round-trips, header table, loud rejects OK")
+
+
+def test_band_varying_sample_rep():
+    """Band-varying damping/offset (4.9, table 5-12): per-band phi_z/psi_z carried as
+    Damping/Offset Table subblocks, decoded standalone; flag abuse rejected loudly."""
+    img = cube(6, 16, 16)
+    base = dict(num_bands=6, height=16, width=16, dynamic_range=16)
+    phis = [z % 4 for z in range(6)]
+    psis = [(z + 1) % 4 for z in range(6)]
+    for kw in (dict(phi=phis, psi=1), dict(phi=1, psi=psis), dict(phi=phis, psi=psis)):
+        p = CodecParams(**base, theta=2, absolute_error_limit=3, **kw)
+        blob = Ccsds123(p).compress(img)
+        out = Ccsds123.decompress_standalone(blob)
+        assert int(np.abs(img - out).max()) <= 3
+        parsed, _ = rc.parse_header(blob)
+        assert parsed["phi"] == kw["phi"] and parsed["psi"] == kw["psi"]
+    fixed = Ccsds123(CodecParams(**base, theta=2, phi=1, psi=2,
+                                 absolute_error_limit=3)).compress(img)
+    var = Ccsds123(CodecParams(**base, theta=2, phi=phis, psi=psis,
+                               absolute_error_limit=3)).compress(img)
+    assert var != fixed, "band-varying phi/psi did not change the stream"
+    # lossless subpart is header bytes 17-19: theta, damping flags, offset flags
+    hdr = bytearray(rc.pack_header(CodecParams(**base, theta=2, phi=phis, psi=0)))
+    hdr[18] &= 0xDF                             # band-varying without a table
+    assert _raises(NotImplementedError, rc.parse_header, bytes(hdr))
+    hdr2 = bytearray(rc.pack_header(CodecParams(**base, theta=2, phi=1, psi=0)))
+    hdr2[18] |= 0x20                            # table flag without band-varying
+    assert _raises(ValueError, rc.parse_header, bytes(hdr2))
+    assert _raises(AssertionError, Ccsds123, CodecParams(**base, theta=2, phi=[1, 2], psi=0))
+    print("  band-varying sample rep: phi/psi tables round-trip, loud rejects OK")
+
+
+def test_hybrid_sigma_init():
+    """User-specified hybrid initial accumulators (5.4.3.3.4.3): out-of-band, alter
+    the stream, and decoding never needs them (finals travel in the stream tail)."""
+    img = cube(8, 16, 16)
+    sig = [(37 * z + 5) % (1 << 17) for z in range(8)]
+    base = dict(num_bands=8, height=16, width=16, dynamic_range=16, entropy_coder="hybrid")
+    for kw in (dict(), dict(encoding_order="BI", interleave_depth=2)):
+        blob = Ccsds123(CodecParams(**base, hybrid_sigma_init=sig, **kw)).compress(img)
+        assert blob != Ccsds123(CodecParams(**base, **kw)).compress(img), \
+            "custom accumulators did not change the stream"
+        assert np.array_equal(img, Ccsds123.decompress_standalone(blob)), \
+            "standalone decode must work without knowing Sigma_z(0)"
+    assert _raises(AssertionError, Ccsds123,
+                   CodecParams(**base, hybrid_sigma_init=[1 << 17] * 8))
+    print("  hybrid sigma init: BSQ+BI streams differ, standalone decode OK")
+
+
+def test_output_word_size():
+    """Output word size B (5.2.2): the compressed image is padded to a multiple of
+    B bytes; the User-Defined Data byte survives the header."""
+    img = cube(6, 12, 12)
+    base = dict(num_bands=6, height=12, width=12, dynamic_range=16)
+    for kw in (dict(), dict(entropy_coder="hybrid"), dict(encoding_order="BI")):
+        for B in (3, 8):
+            p = CodecParams(**base, output_word_size=B, user_data=0xA5, **kw)
+            blob = Ccsds123(p).compress(img)
+            assert len(blob) % B == 0, f"blob not a multiple of B={B} for {kw}"
+            assert np.array_equal(img, Ccsds123.decompress_standalone(blob))
+            parsed, _ = rc.parse_header(blob)
+            assert parsed["output_word_size"] == B and parsed["user_data"] == 0xA5
+    assert _raises(AssertionError, Ccsds123, CodecParams(**base, output_word_size=9))
+    print("  output word size: B=3/8 padding for all three coder paths + user data OK")
 
 
 def test_sample_rep_phi():
@@ -703,12 +916,16 @@ if __name__ == "__main__":
                test_ccsds_header, test_hybrid_codec,
                test_numba_byte_identical, test_hybrid_numba_identical,
                test_package_imports_without_torch, test_metrics,
-               test_bi_order, test_periodic_error_limits, test_bi_numba_identical,
+               test_bi_order, test_periodic_error_limits, test_hybrid_bi,
+               test_bi_numba_identical, test_accumulator_init_table,
+               test_band_varying_sample_rep, test_hybrid_sigma_init, test_output_word_size,
                test_lossless_crop, test_reduced_mode,
                test_sample_rep_phi, test_sample_rep_psi, test_narrow_local_sums,
                test_column_local_sums, test_high_dynamic_range_and_signed,
                test_relative_error_bound, test_near_lossless,
                test_band_dependent_error_limits, test_lossless_region,
+               test_custom_weight_init, test_weight_exp_offset,
+               test_supplementary_tables, test_torch_wrapper,
                test_indian_pines_if_present):
         print(f"\n[{fn.__name__}]")
         fn()

@@ -51,31 +51,50 @@ header:
 recon = CCSDS123.decompress_bytes(blob)
 ```
 
+PyTorch (eval-only nn.Module through the real bitstream, torch not required
+otherwise):
+
+```python
+from ccsds import CCSDS123Module
+out = CCSDS123Module(dynamic_range=14)(x)   # x: [Z, Y, X] or [B, Z, Y, X] int tensor
+out["reconstruction"], out["bpppb"]
+```
+
 ## What it implements
 
 - **Adaptive predictor** (4.x): local sums (eq 20-23, wide/narrow × neighbor/column),
   directional and central local differences, the full weight update rule with the
-  time varying scaling exponent ρ(t), high-resolution prediction, the quantizer, and
-  the fold over mapped quantizer index.
+  time varying scaling exponent ρ(t), default or custom weight initialization
+  (4.6.3.3) and per-band weight exponent offsets (4.10.4), both carried as header
+  tables, high-resolution prediction, the quantizer, and the fold over mapped
+  quantizer index.
 - **Fidelity control** (4.8.2): lossless, absolute, relative, and combined error
-  limits, each band-independent or band-dependent.
+  limits, each band-independent or band-dependent; **sample representatives** (4.9)
+  with fixed or per-band damping/offset.
 - **Encoding order** (5.4.2): BSQ (default) or band-interleaved (BI: BIP, BIL, or an
   intermediate sub-frame depth M), with optional **periodic error-limit updating**
   (4.8.2.4) that carries per-period limits in the body.
-- **Two entropy coders**: sample-adaptive (5.4.3.2, default) and hybrid (5.4.3.3,
-  `entropy_coder="hybrid"`) using the real annex-B low-entropy tables with
-  reverse-order suffix-free decoding.
+- **Two entropy coders**, in either encoding order: sample-adaptive (5.4.3.2,
+  default; constant or per-band accumulator init) and hybrid (5.4.3.3,
+  `entropy_coder="hybrid"`) with the real annex-B low-entropy tables,
+  reverse-order suffix-free decoding and user-set initial accumulators.
 - **Bit-exact CCSDS 5.3 header** (`io/ccsds_header.py`): packs/parses every supported
-  parameter; the lossless header is 19 bytes.
+  parameter, including supplementary information tables (3.5), the user data byte
+  and output word size B; the default lossless header is 19 bytes.
 
-Not implemented: the block-adaptive coder (5.4.3.4 / CCSDS-121) and the optional
-supplementary / weight tables.
+Not implemented: the block-adaptive entropy coder (5.4.3.4 / CCSDS-121).
+
+The encoder is cross-validated byte-for-byte against the independent
+[NTNU verification model](https://github.com/NTNU-SmallSat-Lab/ccsds123_issue_2_verification_model)
+over 32 configurations (`tools/crossval_ntnu.py`); the NTNU model is itself
+verified against the official CCSDS test vector set.
 
 ## Layout
 
 ```
 src/ccsds/
   codec.py                 CCSDS123 high-level wrapper (numpy or torch)
+  torch_wrapper.py         CCSDS123Module (eval-only nn.Module)
   metrics.py               PSNR / MSSIM / SAM (numpy-only)
   core/reference_codec.py  Ccsds123 / CodecParams (the codec)
   core/_codec_numba.py     numba kernel (byte-identical fast path)
@@ -88,6 +107,7 @@ tests/
   synthetic_hsi.py         deterministic test cube (pure numpy)
   run_full_cube.py         full-size headline run
 tools/extract_annexb_tables.py   regenerate annexb_tables.json from the standard text
+tools/crossval_ntnu.py           byte-level cross-validation vs the NTNU model
 examples/evaluate.py             compress a cube + report ratio / PSNR / MSSIM / SAM
 ```
 

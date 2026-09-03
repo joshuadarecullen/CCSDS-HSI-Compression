@@ -156,50 +156,63 @@ def _low_index(Sigma, Gamma, Tarr):
 
 
 @njit
-def _enc_kernel(delta, Nz, Ny, Nx, D, gamma0, gstar, umax, sigma_init,
+def _e_samp(buf, pos, d, t, z, Sigma, cur, G, resc, D, umax,
+            Tarr, Larr, e_child, e_op, e_ol, e_bits, e_root):
+    if t == 0:
+        for b in range(D - 1, -1, -1):
+            if (d >> b) & 1:
+                buf[pos >> 3] |= (1 << (7 - (pos & 7)))
+            pos += 1
+        return pos
+    if resc[t]:
+        if Sigma[z] & 1:
+            buf[pos >> 3] |= (1 << (7 - (pos & 7)))
+        pos += 1
+        Sigma[z] = (Sigma[z] + 4 * d + 1) >> 1
+    else:
+        Sigma[z] = Sigma[z] + 4 * d
+    Gamma = G[t]
+    if Sigma[z] * (1 << 14) >= Tarr[0] * Gamma:                  # high-entropy
+        pos = _wgpo2(buf, pos, d, _high_k(Sigma[z], Gamma, D), umax, D)
+    else:                                                        # low-entropy
+        i = _low_index(Sigma[z], Gamma, Tarr)
+        if d <= Larr[i]:
+            sym = d
+        else:
+            sym = 13
+            pos = _wgpo2(buf, pos, d - Larr[i] - 1, 0, umax, D)
+        node = e_child[cur[i]][sym]
+        cur[i] = node
+        if e_op[node] != -1:                                     # complete codeword
+            p = e_op[node]
+            for b in range(e_ol[node]):
+                if e_bits[p + b]:
+                    buf[pos >> 3] |= (1 << (7 - (pos & 7)))
+                pos += 1
+            cur[i] = e_root[i]
+    return pos
+
+
+@njit
+def _enc_kernel(delta, Nz, Ny, Nx, D, gamma0, gstar, umax, sigma_init, M,
                 G, resc, Tarr, Larr, e_child, e_op, e_ol, e_fp, e_fl, e_bits, e_root, buf):
     N = Ny * Nx
     pos = 0
     cur = e_root.copy()
-    sigma_final = np.zeros(Nz, np.int64)
-    for z in range(Nz):
-        Sigma = sigma_init
-        d0 = delta[z, 0, 0]
-        for b in range(D - 1, -1, -1):
-            if (d0 >> b) & 1:
-                buf[pos >> 3] |= (1 << (7 - (pos & 7)))
-            pos += 1
-        for t in range(1, N):
-            y = t // Nx
-            x = t - y * Nx
-            d = delta[z, y, x]
-            if resc[t]:
-                if Sigma & 1:
-                    buf[pos >> 3] |= (1 << (7 - (pos & 7)))
-                pos += 1
-                Sigma = (Sigma + 4 * d + 1) >> 1
-            else:
-                Sigma = Sigma + 4 * d
-            Gamma = G[t]
-            if Sigma * (1 << 14) >= Tarr[0] * Gamma:                 # high-entropy
-                pos = _wgpo2(buf, pos, d, _high_k(Sigma, Gamma, D), umax, D)
-            else:                                                    # low-entropy
-                i = _low_index(Sigma, Gamma, Tarr)
-                if d <= Larr[i]:
-                    sym = d
-                else:
-                    sym = 13
-                    pos = _wgpo2(buf, pos, d - Larr[i] - 1, 0, umax, D)
-                node = e_child[cur[i]][sym]
-                cur[i] = node
-                if e_op[node] != -1:                                 # complete codeword
-                    p = e_op[node]
-                    for b in range(e_ol[node]):
-                        if e_bits[p + b]:
-                            buf[pos >> 3] |= (1 << (7 - (pos & 7)))
-                        pos += 1
-                    cur[i] = e_root[i]
-        sigma_final[z] = Sigma
+    Sigma = sigma_init.copy()
+    if M == 0:                                                   # BSQ order
+        for z in range(Nz):
+            for t in range(N):
+                pos = _e_samp(buf, pos, delta[z, t // Nx, t % Nx], t, z, Sigma, cur, G,
+                              resc, D, umax, Tarr, Larr, e_child, e_op, e_ol, e_bits, e_root)
+    else:                                                        # BI order (5.4.2.2)
+        for y in range(Ny):
+            for i in range((Nz + M - 1) // M):
+                z1 = min((i + 1) * M, Nz)
+                for x in range(Nx):
+                    for z in range(i * M, z1):
+                        pos = _e_samp(buf, pos, delta[z, y, x], y * Nx + x, z, Sigma, cur, G,
+                                      resc, D, umax, Tarr, Larr, e_child, e_op, e_ol, e_bits, e_root)
     # ---- tail ----
     for i in range(16):
         node = cur[i]
@@ -210,7 +223,7 @@ def _enc_kernel(delta, Nz, Ny, Nx, D, gamma0, gstar, umax, sigma_init,
             pos += 1
     nbs = 2 + D + gstar
     for z in range(Nz):
-        s = sigma_final[z]
+        s = Sigma[z]
         for b in range(nbs - 1, -1, -1):
             if (s >> b) & 1:
                 buf[pos >> 3] |= (1 << (7 - (pos & 7)))
@@ -221,7 +234,48 @@ def _enc_kernel(delta, Nz, Ny, Nx, D, gamma0, gstar, umax, sigma_init,
 
 
 @njit
-def _dec_kernel(rev, Nz, Ny, Nx, D, gamma0, gstar, umax, G, resc, Tarr, Larr,
+def _d_samp(rev, pos, t, z, Nx, Sigma, symbuf, symtop, out, G, resc, D, umax,
+            Tarr, Larr, d_child, d_sp, d_sl, d_syms, d_root):
+    if t == 0:
+        v = 0
+        for j in range(D):
+            v |= rev[pos] << j
+            pos += 1
+        out[z, 0, 0] = v
+        return pos
+    Gamma = G[t]
+    if Sigma[z] * (1 << 14) >= Tarr[0] * Gamma:                 # high
+        d, pos = _rgpo2(rev, pos, _high_k(Sigma[z], Gamma, D), umax, D)
+    else:                                                       # low
+        i = _low_index(Sigma[z], Gamma, Tarr)
+        if symtop[i] == 0:                                      # refill from output codeword
+            node = d_root[i]
+            while d_sp[node] == -1:
+                node = d_child[node][rev[pos]]
+                pos += 1
+            p = d_sp[node]
+            for b in range(d_sl[node]):
+                symbuf[i][symtop[i]] = d_syms[p + b]
+                symtop[i] += 1
+        symtop[i] -= 1
+        sym = symbuf[i][symtop[i]]
+        if sym == 13:
+            r, pos = _rgpo2(rev, pos, 0, umax, D)
+            d = r + Larr[i] + 1
+        else:
+            d = sym
+    out[z, t // Nx, t % Nx] = d
+    if resc[t]:
+        b = rev[pos]
+        pos += 1
+        Sigma[z] = 2 * Sigma[z] - 4 * d - b
+    else:
+        Sigma[z] = Sigma[z] - 4 * d
+    return pos
+
+
+@njit
+def _dec_kernel(rev, Nz, Ny, Nx, D, gamma0, gstar, umax, M, G, resc, Tarr, Larr,
                 d_child, d_sp, d_sl, d_syms, d_root,
                 f_child, f_sp, f_sl, f_syms, f_root, out):
     N = Ny * Nx
@@ -230,13 +284,13 @@ def _dec_kernel(rev, Nz, Ny, Nx, D, gamma0, gstar, umax, G, resc, Tarr, Larr,
         pos += 1
     pos += 1                                                        # marker
     nbs = 2 + D + gstar
-    sigma_final = np.zeros(Nz, np.int64)
+    Sigma = np.zeros(Nz, np.int64)
     for z in range(Nz - 1, -1, -1):
         v = 0
         for j in range(nbs):
             v |= rev[pos] << j
             pos += 1
-        sigma_final[z] = v
+        Sigma[z] = v
     symbuf = np.zeros((16, 320), np.int64)
     symtop = np.zeros(16, np.int64)
     for i in range(15, -1, -1):                                     # flush -> active prefix
@@ -248,44 +302,19 @@ def _dec_kernel(rev, Nz, Ny, Nx, D, gamma0, gstar, umax, G, resc, Tarr, Larr,
         for b in range(f_sl[node]):
             symbuf[i][symtop[i]] = f_syms[p + b]
             symtop[i] += 1
-    for z in range(Nz - 1, -1, -1):
-        Sigma = sigma_final[z]
-        for t in range(N - 1, 0, -1):
-            y = t // Nx
-            x = t - y * Nx
-            Gamma = G[t]
-            if Sigma * (1 << 14) >= Tarr[0] * Gamma:                # high
-                d, pos = _rgpo2(rev, pos, _high_k(Sigma, Gamma, D), umax, D)
-            else:                                                   # low
-                i = _low_index(Sigma, Gamma, Tarr)
-                if symtop[i] == 0:                                  # refill from output codeword
-                    node = d_root[i]
-                    while d_sp[node] == -1:
-                        node = d_child[node][rev[pos]]
-                        pos += 1
-                    p = d_sp[node]
-                    for b in range(d_sl[node]):
-                        symbuf[i][symtop[i]] = d_syms[p + b]
-                        symtop[i] += 1
-                symtop[i] -= 1
-                sym = symbuf[i][symtop[i]]
-                if sym == 13:
-                    r, pos = _rgpo2(rev, pos, 0, umax, D)
-                    d = r + Larr[i] + 1
-                else:
-                    d = sym
-            out[z, y, x] = d
-            if resc[t]:
-                b = rev[pos]
-                pos += 1
-                Sigma = 2 * Sigma - 4 * d - b
-            else:
-                Sigma = Sigma - 4 * d
-        v = 0
-        for j in range(D):
-            v |= rev[pos] << j
-            pos += 1
-        out[z, 0, 0] = v
+    if M == 0:                                                      # BSQ order
+        for z in range(Nz - 1, -1, -1):
+            for t in range(N - 1, -1, -1):
+                pos = _d_samp(rev, pos, t, z, Nx, Sigma, symbuf, symtop, out, G, resc,
+                              D, umax, Tarr, Larr, d_child, d_sp, d_sl, d_syms, d_root)
+    else:                                                           # BI order (5.4.2.2)
+        for y in range(Ny - 1, -1, -1):
+            for i in range((Nz + M - 1) // M - 1, -1, -1):
+                z1 = min((i + 1) * M, Nz)
+                for x in range(Nx - 1, -1, -1):
+                    for z in range(z1 - 1, i * M - 1, -1):
+                        pos = _d_samp(rev, pos, y * Nx + x, z, Nx, Sigma, symbuf, symtop, out, G,
+                                      resc, D, umax, Tarr, Larr, d_child, d_sp, d_sl, d_syms, d_root)
     return pos
 
 
@@ -294,13 +323,14 @@ def _gamma_seq(hc, N):
     return np.array(G, np.int64), np.array([1 if r else 0 for r in resc], np.int64)
 
 
-def encode_numba(hc, A, delta):
+def encode_numba(hc, A, delta, M=0):
     Nz, Ny, Nx = delta.shape
     G, resc = _gamma_seq(hc, Ny * Nx)
     cap = (Nz * Ny * Nx * (hc.umax + hc.D) + Nz * (2 + hc.D + hc.gstar) + 4096) // 8 + 64
     buf = np.zeros(cap, np.uint8)
+    sig0 = np.array([hc._sigma_init(z) for z in range(Nz)], np.int64)
     nbits = _enc_kernel(np.ascontiguousarray(delta, np.int64), Nz, Ny, Nx, hc.D,
-                        hc.g0, hc.gstar, hc.umax, hc._sigma_init(), G, resc,
+                        hc.g0, hc.gstar, hc.umax, sig0, M, G, resc,
                         A["Tarr"], A["Larr"], A["e_child"], A["e_op"], A["e_ol"],
                         A["e_fp"], A["e_fl"], A["e_bits"], A["e_root"], buf)
     while nbits % 8:                                                 # fill to byte
@@ -308,13 +338,13 @@ def encode_numba(hc, A, delta):
     return bytes(buf[:nbits // 8])
 
 
-def decode_numba(hc, A, body, shape):
+def decode_numba(hc, A, body, shape, M=0):
     Nz, Ny, Nx = shape
     G, resc = _gamma_seq(hc, Ny * Nx)
     fwd = np.unpackbits(np.frombuffer(body, np.uint8))
     rev = np.ascontiguousarray(fwd[::-1])
     out = np.zeros(shape, np.int64)
-    _dec_kernel(rev, Nz, Ny, Nx, hc.D, hc.g0, hc.gstar, hc.umax, G, resc,
+    _dec_kernel(rev, Nz, Ny, Nx, hc.D, hc.g0, hc.gstar, hc.umax, M, G, resc,
                 A["Tarr"], A["Larr"], A["d_child"], A["d_sp"], A["d_sl"], A["d_syms"],
                 A["d_root"], A["f_child"], A["f_sp"], A["f_sl"], A["f_syms"], A["f_root"], out)
     return out

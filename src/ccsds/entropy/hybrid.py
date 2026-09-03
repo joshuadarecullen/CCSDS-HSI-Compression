@@ -95,11 +95,12 @@ class _Bits:
 
 class HybridCoder:
     def __init__(self, dynamic_range: int, gamma0: int = 1, gamma_star: int = 6,
-                 u_max: int = 18) -> None:
+                 u_max: int = 18, sigma_init=None) -> None:
         self.D = dynamic_range
         self.g0 = gamma0
         self.gstar = gamma_star
         self.umax = u_max
+        self.sinit = sigma_init          # per-band Sigma_z(0) (5.4.3.3.4.3), None = default
         self._L, self._T = _L, _T
         self.code, self.flush = _load_tables()
         # decode tries (reversed-bit) for each code's outputs and flush words
@@ -128,7 +129,9 @@ class HybridCoder:
                 G[t] = prev + 1
         return G, resc
 
-    def _sigma_init(self) -> int:
+    def _sigma_init(self, z: int = 0) -> int:
+        if self.sinit is not None:
+            return int(self.sinit[z])
         # in [0, 2^(D+gamma0)) per 5.4.3.3.4.3; the min() only binds at D=2
         return min(4 << self.g0, (1 << (self.D + self.g0)) - 1)
 
@@ -178,55 +181,68 @@ class HybridCoder:
         return v
 
     # encode
-    def encode(self, delta: np.ndarray) -> bytes:
-        if self.use_numba:
-            return _HN.encode_numba(self, self._arrays(), delta)
+    def encode(self, delta: np.ndarray, M: int = 0, limits=None) -> bytes:
+        """M=0: BSQ, M>=1: BI depth M (5.4.2.2). limits = (u, lay, period_abs,
+        period_rel) writes the periodic error limits at row starts (4.8.2.4)."""
+        if self.use_numba and limits is None:
+            return _HN.encode_numba(self, self._arrays(), delta, M)
         Nz, Ny, Nx = delta.shape
         N = Ny * Nx
         D, gstar = self.D, self.gstar
-        full = (1 << gstar) - 1
         G, resc = self._gamma_seq(N)
         bits: List[int] = []
         active: List[List] = [[] for _ in range(16)]
-        sigma_final: List[int] = []
+        Sigma = [self._sigma_init(z) for z in range(Nz)]
 
-        for z in range(Nz):
-            Sigma = self._sigma_init()
-            d0 = int(delta[z, 0, 0])
-            bits.extend((d0 >> (D - 1 - b)) & 1 for b in range(D))     # 5.4.3.3.5.1.3
-            for t in range(1, N):
-                y, x = divmod(t, Nx)
-                d = int(delta[z, y, x])
-                rescale = resc[t]
-                if rescale:
-                    bits.append(Sigma & 1)                            # 5.4.3.3.5.1.2 (LSB before delta)
-                    Sigma = (Sigma + 4 * d + 1) >> 1
+        def samp(z, t):
+            d = int(delta[z, t // Nx, t % Nx])
+            if t == 0:
+                bits.extend((d >> (D - 1 - b)) & 1 for b in range(D))  # 5.4.3.3.5.1.3
+                return
+            if resc[t]:
+                bits.append(Sigma[z] & 1)                     # 5.4.3.3.5.1.2 (LSB before delta)
+                Sigma[z] = (Sigma[z] + 4 * d + 1) >> 1
+            else:
+                Sigma[z] += 4 * d
+            Gamma = G[t]
+            if self._is_high(Sigma[z], Gamma):
+                bits.extend(self._rev_gpo2_fwd(d, self._high_k(Sigma[z], Gamma)))
+            else:
+                i = self._low_index(Sigma[z], Gamma)
+                if d <= _L[i]:
+                    sym = d
                 else:
-                    Sigma = Sigma + 4 * d
-                Gamma = G[t]
-                if self._is_high(Sigma, Gamma):
-                    bits.extend(self._rev_gpo2_fwd(d, self._high_k(Sigma, Gamma)))
-                else:
-                    i = self._low_index(Sigma, Gamma)
-                    if d <= _L[i]:
-                        sym = d
-                    else:
-                        sym = _X
-                        bits.extend(self._rev_gpo2_fwd(d - _L[i] - 1, 0))   # residual
-                    active[i].append(sym)
-                    key = tuple(active[i])
-                    cw = self.code[i].get(key)
-                    if cw is not None:
-                        bits.extend(int(c) for c in cw)
-                        active[i] = []
-            sigma_final.append(Sigma)
+                    sym = _X
+                    bits.extend(self._rev_gpo2_fwd(d - _L[i] - 1, 0))   # residual
+                active[i].append(sym)
+                cw = self.code[i].get(tuple(active[i]))
+                if cw is not None:
+                    bits.extend(int(c) for c in cw)
+                    active[i] = []
+
+        if M:
+            for y in range(Ny):
+                if limits and y % (1 << limits[0]) == 0:
+                    pi = y >> limits[0]
+                    au, ru, da, dr, DA, DR = limits[1]
+                    for used, dep, nb, vals in ((au, da, DA, limits[2]), (ru, dr, DR, limits[3])):
+                        for v in ((vals[pi] if dep else [vals[pi]]) if used else []):
+                            bits.extend((int(v) >> (nb - 1 - b)) & 1 for b in range(nb))
+                for i in range((Nz + M - 1) // M):
+                    for x in range(Nx):
+                        for z in range(i * M, min((i + 1) * M, Nz)):
+                            samp(z, y * Nx + x)
+        else:
+            for z in range(Nz):
+                for t in range(N):
+                    samp(z, t)
 
         # tail (5.4.3.3.5.4)
         for i in range(16):
             bits.extend(int(c) for c in self.flush[i][tuple(active[i])])
         nbits_sigma = 2 + D + gstar
         for z in range(Nz):
-            s = sigma_final[z]
+            s = Sigma[z]
             bits.extend((s >> (nbits_sigma - 1 - b)) & 1 for b in range(nbits_sigma))
         bits.append(1)                                                # marker
         while len(bits) % 8:
@@ -240,9 +256,11 @@ class HybridCoder:
         return bytes(out)
 
     # decode (reverse-order)
-    def decode(self, body: bytes, shape: Tuple[int, int, int]) -> np.ndarray:
-        if self.use_numba:
-            return _HN.decode_numba(self, self._arrays(), body, shape)
+    def decode(self, body: bytes, shape: Tuple[int, int, int], M: int = 0, limits=None):
+        """Inverse of encode. limits = (u, lay, nper) also recovers the per-period
+        limits; the return is then (delta, period_abs, period_rel)."""
+        if self.use_numba and limits is None:
+            return _HN.decode_numba(self, self._arrays(), body, shape, M)
         Nz, Ny, Nx = shape
         N = Ny * Nx
         D, gstar = self.D, self.gstar
@@ -254,38 +272,54 @@ class HybridCoder:
             pass
         # (the '1' just consumed is the marker)
         nbits_sigma = 2 + D + gstar
-        sigma_final = [0] * Nz
+        Sigma = [0] * Nz
         for z in range(Nz - 1, -1, -1):
-            sigma_final[z] = r.val(nbits_sigma)
+            Sigma[z] = r.val(nbits_sigma)
         active = [None] * 16
         for i in range(15, -1, -1):
             active[i] = r.match(self._flush_trie[i])
         sym_buf = [list(active[i]) for i in range(16)]               # pop() -> reverse order
 
         delta = np.zeros(shape, dtype=np.int64)
-        for z in range(Nz - 1, -1, -1):
-            Sigma = sigma_final[z]
-            for t in range(N - 1, 0, -1):
-                y, x = divmod(t, Nx)
-                Gamma = G[t]
-                if self._is_high(Sigma, Gamma):
-                    d = self._rev_gpo2_dec(r, self._high_k(Sigma, Gamma))
-                else:
-                    i = self._low_index(Sigma, Gamma)
-                    if not sym_buf[i]:
-                        sym_buf[i] = list(r.match(self._out_trie[i]))
-                    sym = sym_buf[i].pop()
-                    if sym == _X:
-                        d = self._rev_gpo2_dec(r, 0) + _L[i] + 1
-                    else:
-                        d = sym
-                delta[z, y, x] = d
-                if resc[t]:
-                    b = r.one()
-                    Sigma = 2 * Sigma - 4 * d - b
-                else:
-                    Sigma = Sigma - 4 * d
-            delta[z, 0, 0] = r.val(D)
+
+        def samp(z, t):
+            if t == 0:
+                delta[z, 0, 0] = r.val(D)
+                return
+            Gamma = G[t]
+            if self._is_high(Sigma[z], Gamma):
+                d = self._rev_gpo2_dec(r, self._high_k(Sigma[z], Gamma))
+            else:
+                i = self._low_index(Sigma[z], Gamma)
+                if not sym_buf[i]:
+                    sym_buf[i] = list(r.match(self._out_trie[i]))
+                sym = sym_buf[i].pop()
+                d = self._rev_gpo2_dec(r, 0) + _L[i] + 1 if sym == _X else sym
+            delta[z, t // Nx, t % Nx] = d
+            if resc[t]:
+                Sigma[z] = 2 * Sigma[z] - 4 * d - r.one()
+            else:
+                Sigma[z] -= 4 * d
+
+        if M:
+            pa, pr = ([0] * limits[2], [0] * limits[2]) if limits else (None, None)
+            for y in range(Ny - 1, -1, -1):
+                for i in range((Nz + M - 1) // M - 1, -1, -1):
+                    for x in range(Nx - 1, -1, -1):
+                        for z in range(min((i + 1) * M, Nz) - 1, i * M - 1, -1):
+                            samp(z, y * Nx + x)
+                if limits and y % (1 << limits[0]) == 0:
+                    pi = y >> limits[0]
+                    au, ru, da, dr, DA, DR = limits[1]
+                    for used, dep, nb, got in ((ru, dr, DR, pr), (au, da, DA, pa)):
+                        if used:
+                            got[pi] = [r.val(nb) for _ in range(Nz)][::-1] if dep else r.val(nb)
+            if limits:
+                return delta, pa, pr
+        else:
+            for z in range(Nz - 1, -1, -1):
+                for t in range(N - 1, -1, -1):
+                    samp(z, t)
         return delta
 
 
