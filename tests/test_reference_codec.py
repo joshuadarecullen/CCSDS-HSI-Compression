@@ -295,6 +295,8 @@ def test_numba_byte_identical():
         dict(num_prediction_bands=2, full=False, local_sum_type="narrow_neighbor"),
         dict(num_prediction_bands=3, full=True, theta=2, phi=1),
         dict(num_prediction_bands=3, full=True, theta=2, phi=1, psi=2, absolute_error_limit=4),
+        dict(num_prediction_bands=2, full=True, weight_init_resolution=5,
+             weight_init=[[3, -7, 12] + [-9, 4][:min(z, 2)] for z in range(20)]),
     ]
     for kw in configs:
         p = CodecParams(num_bands=20, height=24, width=24, dynamic_range=16, **kw)
@@ -305,7 +307,7 @@ def test_numba_byte_identical():
         dn = Ccsds123(p)
         dp = Ccsds123(p); dp.use_numba = False
         assert np.array_equal(dn.decompress(cp.compress(img)), dp.decompress(cn.compress(img)))
-    print("  numba kernel BYTE-IDENTICAL to pure-Python reference (5 configs) + cross-decode OK")
+    print("  numba kernel BYTE-IDENTICAL to pure-Python reference (6 configs) + cross-decode OK")
 
 
 def test_hybrid_codec():
@@ -477,6 +479,49 @@ def test_reduced_mode():
     out, st = _roundtrip(img, num_prediction_bands=3, full=False)
     assert np.array_equal(img, out), "reduced-mode lossless round-trip failed"
     print(f"  reduced-mode lossless: max|err|={np.abs(img - out).max()}  ratio={st['ratio']:.3f}:1")
+
+
+def test_custom_weight_init():
+    """Custom weight initialization (Eq 35) + Weight Tables header subpart
+    (5.3.3.3.2): vectors must survive the header round-trip and decode standalone."""
+    rng = np.random.default_rng(7)
+    img = cube(8, 20, 20)
+    Q = 6
+    half = 1 << (Q - 1)
+    for full in (True, False):
+        p0 = CodecParams(num_bands=8, height=20, width=20, dynamic_range=16,
+                         num_prediction_bands=3, full=full)
+        lam = [[int(rng.integers(-half, half))
+                for _ in range(p0.band_components(z))] for z in range(8)]
+        p = CodecParams(num_bands=8, height=20, width=20, dynamic_range=16,
+                        num_prediction_bands=3, full=full,
+                        weight_init=lam, weight_init_resolution=Q)
+        blob = Ccsds123(p).compress(img)
+        out = Ccsds123.decompress_standalone(blob)
+        assert np.array_equal(img, out), f"custom weight init round-trip failed (full={full})"
+        parsed, _ = rc.parse_header(blob)
+        assert parsed["weight_init"] == lam and parsed["weight_init_resolution"] == Q, \
+            "weight init vectors did not survive the header round-trip"
+        # custom stream must differ from default-init stream (weights actually used)
+        blob_def = Ccsds123(p0).compress(img)
+        assert blob != blob_def, "custom weight init produced the default bitstream"
+    # Eq (35) NOTE: in the (Omega+3)-bit two's complement of each w, the Q MSBs
+    # equal Lambda and the rest are '0' followed by '1's
+    p = CodecParams(num_bands=2, height=4, width=4, dynamic_range=16, omega=13,
+                    num_prediction_bands=1, full=False,
+                    weight_init=[[], [-17]], weight_init_resolution=6)
+    w = Ccsds123(p)._init_weights(1)[0]
+    nbits, Q = 13 + 3, 6
+    tc = w & ((1 << nbits) - 1)
+    assert tc >> (nbits - Q) == (-17) & ((1 << Q) - 1), "Q MSBs must equal Lambda"
+    assert tc & ((1 << (nbits - Q)) - 1) == (1 << (nbits - Q - 1)) - 1, \
+        "low bits must be '0' then all '1's"
+    # Q = Omega+3 means w = Lambda exactly
+    p = CodecParams(num_bands=2, height=4, width=4, dynamic_range=16, omega=13,
+                    num_prediction_bands=1, full=False,
+                    weight_init=[[], [-17]], weight_init_resolution=16)
+    assert Ccsds123(p)._init_weights(1) == [-17]
+    print("  custom weight init: full+reduced round-trips, header table, Eq 35 bit layout OK")
 
 
 def test_sample_rep_phi():

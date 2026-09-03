@@ -5,12 +5,14 @@ Bit-exact CCSDS-123.0-B-2 compressed-image header (section 5.3).
 Field widths follow 5.3 exactly. Covers the parts this codec emits:
 
   * Image Metadata, Essential subpart (table 5-3)
-  * Predictor Metadata, Primary (table 5-6) + Quantization (tables 5-8..5-11,
-    near-lossless) + Sample Representative (table 5-12, Theta > 0)
+  * Predictor Metadata, Primary (table 5-6) + Weight Tables (table 5-7, custom
+    weight initialization) + Quantization (tables 5-8..5-11, near-lossless) +
+    Sample Representative (table 5-12, Theta > 0)
   * Entropy Coder Metadata (table 5-13 sample-adaptive / 5-14 hybrid)
 
-Out of scope: supplementary tables, custom weight init/exponent tables, and the
-block-adaptive entropy coder (parse_header rejects its coder type).
+Out of scope: supplementary tables, the Weight Exponent Offset Table (parse_header
+rejects its flags), and the block-adaptive entropy coder (parse_header rejects its
+coder type).
 """
 
 from __future__ import annotations
@@ -111,10 +113,20 @@ def pack_header(p) -> bytes:
     bp.w((t_inc_log - 4) & 0xF, 4)              # Weight Update Change Interval
     bp.w((p.v_min + 6) & 0xF, 4)                # Weight Update Initial Parameter
     bp.w((p.v_max + 6) & 0xF, 4)                # Weight Update Final Parameter
+    custom_w = getattr(p, "weight_init", None) is not None
     bp.w(0, 1)                                  # Weight Exponent Offset Table Flag
-    bp.w(0, 1)                                  # Weight Initialization Method (default)
-    bp.w(0, 1)                                  # Weight Initialization Table Flag
-    bp.w(0, 5)                                  # Weight Initialization Resolution
+    bp.w(1 if custom_w else 0, 1)               # Weight Initialization Method
+    bp.w(1 if custom_w else 0, 1)               # Weight Initialization Table Flag
+    bp.w(p.weight_init_resolution if custom_w else 0, 5)   # Weight Initialization Resolution Q
+
+    # Predictor Metadata, Weight Tables subpart (table 5-7): custom weight
+    # initialization vectors Lambda_z as Q-bit two's complement, z-major (5.3.3.3.2)
+    if custom_w:
+        Q = p.weight_init_resolution
+        for row in p.weight_init:
+            for v in row:
+                bp.w(int(v) & ((1 << Q) - 1), Q)
+        bp.align()
 
     # Predictor Metadata, Quantization subpart (near-lossless only)
     if not p.lossless:
@@ -185,14 +197,34 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
     sample_rep_flag = u.r(1)
     P = u.r(4)
     full = (u.r(1) == 0)
-    u.r(1)                                      # Weight Exponent Offset Flag
+    offset_flag = u.r(1)                        # Weight Exponent Offset Flag
     lst = _LST_INV[u.r(2)]
     R = u.r(6); R = R if R != 0 else 64
     omega = u.r(4) + 4
     t_inc = 1 << (u.r(4) + 4)
     v_min = u.r(4) - 6
     v_max = u.r(4) - 6
-    u.r(1); u.r(1); u.r(1); u.r(5)             # weight exponent/init table flags + init resolution
+    offset_table_flag = u.r(1)                  # Weight Exponent Offset Table Flag
+    custom_w = u.r(1) == 1                      # Weight Initialization Method
+    w_table_flag = u.r(1)                       # Weight Initialization Table Flag
+    Q = u.r(5)                                  # Weight Initialization Resolution
+    if offset_flag or offset_table_flag:
+        raise NotImplementedError(
+            "nonzero weight exponent offsets / Weight Exponent Offset Table are not supported")
+
+    # Weight Tables subpart (custom weight initialization vectors)
+    weight_init = None
+    if custom_w:
+        if not w_table_flag:
+            raise ValueError("custom weight initialization without a Weight Initialization "
+                             "Table in the header cannot be decoded (vectors are mission-defined)")
+        def _signed(v: int, n: int) -> int:
+            return v - (1 << n) if v >= (1 << (n - 1)) else v
+        weight_init = []
+        for z in range(Nz):
+            cz = (3 if full else 0) + min(z, P)
+            weight_init.append([_signed(u.r(Q), Q) for _ in range(cz)])
+        u.align()
 
     # Quantization subpart
     bi = (order_bit == 0)
@@ -251,6 +283,7 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
         num_bands=Nz, height=Ny, width=Nx, dynamic_range=D, signed=signed,
         num_prediction_bands=P, full=full, local_sum_type=lst, omega=omega,
         register_size=R, theta=theta, phi=phi, psi=psi,
+        weight_init=weight_init, weight_init_resolution=(Q if custom_w else 0),
         absolute_error_limit=abs_lim, relative_error_limit=rel_lim,
         abs_limit_used=(fc in (1, 3)), rel_limit_used=(fc in (2, 3)),
         v_min=v_min, v_max=v_max, t_inc=t_inc,
