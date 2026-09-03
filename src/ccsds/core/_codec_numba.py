@@ -90,7 +90,7 @@ def _kernel(encode, mode, delta_arr, image, body, buf, spp, recon, cdiff,
             Theta, phi, psi, abs_lim, rel_lim, abs_used, rel_used,
             vmin, vmax, tinc, zinter, zintra,
             gamma0, gstar_full, sigma_init, umax,
-            s_min, s_max, s_mid, w_min, w_max):
+            s_min, s_max, s_mid, w_min, w_max, winit):
     pos = 0
     Cmax = 3 + P
     U = np.zeros(Cmax, dtype=np.int64)
@@ -102,12 +102,8 @@ def _kernel(encode, mode, delta_arr, image, body, buf, spp, recon, cdiff,
         pstar = z if z < P else P
         ci0 = 3 if full == 1 else 0
         Cz = ci0 + pstar
-        if full == 1:
-            w[0] = 0; w[1] = 0; w[2] = 0
-        if pstar > 0:
-            w[ci0] = (7 * (1 << Omega)) // 8
-            for i in range(1, pstar):
-                w[ci0 + i] = w[ci0 + i - 1] // 8
+        for j in range(Cz):                                # default or custom (Eq 33-35)
+            w[j] = winit[z, j]
         gamma = 1 << gamma0
         sigma_acc = sigma_init
 
@@ -348,11 +344,16 @@ def _setup(codec):
     gstar_full = (1 << p.gamma_star) - 1
     do_mod = 1 if p.register_size <= 62 else 0
     au, ru = p.fidelity_layout()[:2]
+    winit = np.zeros((Nz, 3 + p.num_prediction_bands), dtype=np.int64)
+    for z in range(Nz):
+        row = codec._init_weights(z)
+        for j, v in enumerate(row):
+            winit[z, j] = v
     args = (Nz, Ny, Nx, D, p.num_prediction_bands, 1 if p.full else 0, _LST[p.local_sum_type],
             p.omega, p.register_size, do_mod, p.theta, p.phi, p.psi, abs_lim, rel_lim,
             1 if au else 0, 1 if ru else 0, p.v_min, p.v_max, p.t_inc, p.zeta_inter, p.zeta_intra,
             p.gamma0, gstar_full, sigma_init, p.u_max,
-            codec.s_min, codec.s_max, codec.s_mid, codec.w_min, codec.w_max)
+            codec.s_min, codec.s_max, codec.s_mid, codec.w_min, codec.w_max, winit)
     return spp, recon, cdiff, args
 
 

@@ -151,6 +151,12 @@ class CodecParams:
     zeta_inter: int = 0              # inter-band weight exponent offset (central comps)
     zeta_intra: int = 0              # intra-band weight exponent offset (directional comps)
 
+    # custom weight initialization (4.6.3.3): per-band vectors Lambda_z, each of
+    # length C_z = (3 if full else 0) + min(z, P), components signed Q-bit ints.
+    # None = default initialization (Eq 33-34).
+    weight_init: object = None       # list of per-band lists, or None
+    weight_init_resolution: int = 0  # Q (3..Omega+3); 0 with weight_init => Omega+3
+
     # sample-adaptive entropy coder (5.4.3.2)
     gamma0: int = 1                  # initial count exponent (1..8)
     gamma_star: int = 6              # rescaling counter size (max{4,gamma0+1}..11)
@@ -184,6 +190,14 @@ class CodecParams:
         self.relative_error_limit = self._norm_limit(self.relative_error_limit)
         if self.k_init is None:
             self.k_init = min(3, max(0, self.dynamic_range - 2))
+        if self.weight_init is not None:
+            self.weight_init = [[int(v) for v in row] for row in self.weight_init]
+            if self.weight_init_resolution == 0:
+                self.weight_init_resolution = self.omega + 3
+
+    def band_components(self, z: int) -> int:
+        """C_z: number of weight/local-difference components for band z (4.6.1)."""
+        return (3 if self.full else 0) + min(z, self.num_prediction_bands)
 
     @staticmethod
     def _limit_max(v) -> int:
@@ -298,6 +312,17 @@ class CodecParams:
             for v in flat:
                 assert 0 <= int(v) < (1 << lim_bits), \
                     f"error limit {v} does not fit in min(D-1,16)={lim_bits} bits"
+        if self.weight_init is not None:
+            Q = self.weight_init_resolution
+            assert 3 <= Q <= self.omega + 3, "weight init resolution Q must be 3..Omega+3 (4.6.3.3.2)"
+            assert len(self.weight_init) == self.num_bands, \
+                "weight_init needs one vector per band"
+            half = 1 << (Q - 1)
+            for z, row in enumerate(self.weight_init):
+                assert len(row) == self.band_components(z), \
+                    f"weight_init[{z}] must have C_z={self.band_components(z)} components"
+                for v in row:
+                    assert -half <= v < half, f"weight init component {v} not a signed {Q}-bit int"
         if self.local_sum_type not in (
             "wide_neighbor", "narrow_neighbor", "wide_column", "narrow_column"
         ):
@@ -330,9 +355,14 @@ class Ccsds123:
         # Set False to force the pure-Python path.
         self.use_numba = bool(NUMBA_OK and numba_safe(params))
 
-    # weight initialization (default, Eq 33-34)
+    # weight initialization (default Eq 33-34, custom Eq 35)
     def _init_weights(self, z: int) -> List[int]:
         p = self.p
+        if p.weight_init is not None:                       # custom (Eq 35)
+            Q = p.weight_init_resolution
+            scale = 1 << (p.omega + 3 - Q)
+            extra = (1 << (p.omega + 2 - Q)) - 1 if Q <= p.omega + 2 else 0
+            return [scale * lam + extra for lam in p.weight_init[z]]
         p_star = min(z, p.num_prediction_bands)
         centrals: List[int] = []
         if p_star > 0:
