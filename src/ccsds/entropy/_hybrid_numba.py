@@ -234,8 +234,10 @@ def _enc_kernel(delta, Nz, Ny, Nx, D, gamma0, gstar, umax, sigma_init, M,
 
 
 @njit
-def _d_samp(rev, pos, t, z, Nx, Sigma, symbuf, symtop, out, G, resc, D, umax,
+def _d_samp(rev, pos, nbits, t, z, Nx, Sigma, symbuf, symtop, out, G, resc, D, umax,
             Tarr, Larr, d_child, d_sp, d_sl, d_syms, d_root):
+    if pos >= nbits:                                            # body ran out: truncated
+        return -1
     if t == 0:
         v = 0
         for j in range(D):
@@ -275,7 +277,7 @@ def _d_samp(rev, pos, t, z, Nx, Sigma, symbuf, symtop, out, G, resc, D, umax,
 
 
 @njit
-def _dec_kernel(rev, Nz, Ny, Nx, D, gamma0, gstar, umax, M, G, resc, Tarr, Larr,
+def _dec_kernel(rev, nbits, Nz, Ny, Nx, D, gamma0, gstar, umax, M, G, resc, Tarr, Larr,
                 d_child, d_sp, d_sl, d_syms, d_root,
                 f_child, f_sp, f_sl, f_syms, f_root, out):
     N = Ny * Nx
@@ -286,6 +288,8 @@ def _dec_kernel(rev, Nz, Ny, Nx, D, gamma0, gstar, umax, M, G, resc, Tarr, Larr,
     nbs = 2 + D + gstar
     Sigma = np.zeros(Nz, np.int64)
     for z in range(Nz - 1, -1, -1):
+        if pos + nbs > nbits:
+            return -1
         v = 0
         for j in range(nbs):
             v |= rev[pos] << j
@@ -294,6 +298,8 @@ def _dec_kernel(rev, Nz, Ny, Nx, D, gamma0, gstar, umax, M, G, resc, Tarr, Larr,
     symbuf = np.zeros((16, 320), np.int64)
     symtop = np.zeros(16, np.int64)
     for i in range(15, -1, -1):                                     # flush -> active prefix
+        if pos >= nbits:
+            return -1
         node = f_root[i]
         while f_sp[node] == -1:
             node = f_child[node][rev[pos]]
@@ -305,16 +311,21 @@ def _dec_kernel(rev, Nz, Ny, Nx, D, gamma0, gstar, umax, M, G, resc, Tarr, Larr,
     if M == 0:                                                      # BSQ order
         for z in range(Nz - 1, -1, -1):
             for t in range(N - 1, -1, -1):
-                pos = _d_samp(rev, pos, t, z, Nx, Sigma, symbuf, symtop, out, G, resc,
+                pos = _d_samp(rev, pos, nbits, t, z, Nx, Sigma, symbuf, symtop, out, G, resc,
                               D, umax, Tarr, Larr, d_child, d_sp, d_sl, d_syms, d_root)
+                if pos < 0:
+                    return -1
     else:                                                           # BI order (5.4.2.2)
         for y in range(Ny - 1, -1, -1):
             for i in range((Nz + M - 1) // M - 1, -1, -1):
                 z1 = min((i + 1) * M, Nz)
                 for x in range(Nx - 1, -1, -1):
                     for z in range(z1 - 1, i * M - 1, -1):
-                        pos = _d_samp(rev, pos, y * Nx + x, z, Nx, Sigma, symbuf, symtop, out, G,
-                                      resc, D, umax, Tarr, Larr, d_child, d_sp, d_sl, d_syms, d_root)
+                        pos = _d_samp(rev, pos, nbits, y * Nx + x, z, Nx, Sigma, symbuf, symtop,
+                                      out, G, resc, D, umax, Tarr, Larr, d_child, d_sp, d_sl,
+                                      d_syms, d_root)
+                        if pos < 0:
+                            return -1
     return pos
 
 
@@ -341,10 +352,15 @@ def encode_numba(hc, A, delta, M=0):
 def decode_numba(hc, A, body, shape, M=0):
     Nz, Ny, Nx = shape
     G, resc = _gamma_seq(hc, Ny * Nx)
+    nbits = 8 * len(body)
     fwd = np.unpackbits(np.frombuffer(body, np.uint8))
-    rev = np.ascontiguousarray(fwd[::-1])
+    # all-ones tail ends the fill skip; tries are complete, so bounds one sample's overrun
+    rev = np.concatenate([np.ascontiguousarray(fwd[::-1]),
+                          np.ones(2 * (hc.umax + hc.D + hc.gstar) + 512, np.uint8)])
     out = np.zeros(shape, np.int64)
-    _dec_kernel(rev, Nz, Ny, Nx, hc.D, hc.g0, hc.gstar, hc.umax, M, G, resc,
-                A["Tarr"], A["Larr"], A["d_child"], A["d_sp"], A["d_sl"], A["d_syms"],
-                A["d_root"], A["f_child"], A["f_sp"], A["f_sl"], A["f_syms"], A["f_root"], out)
+    pos = _dec_kernel(rev, nbits, Nz, Ny, Nx, hc.D, hc.g0, hc.gstar, hc.umax, M, G, resc,
+                      A["Tarr"], A["Larr"], A["d_child"], A["d_sp"], A["d_sl"], A["d_syms"],
+                      A["d_root"], A["f_child"], A["f_sp"], A["f_sl"], A["f_syms"], A["f_root"], out)
+    if pos < 0 or pos > nbits:
+        raise IndexError("truncated hybrid body")
     return out

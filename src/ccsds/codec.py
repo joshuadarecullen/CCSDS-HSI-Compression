@@ -99,7 +99,13 @@ class CCSDS123:
         return cls(num_bands=nz, height=ny, width=nx, **kwargs)
 
     def compress(self, image) -> bytes:
-        return self.codec.compress(_to_numpy(image).astype(np.int64))
+        arr = _to_numpy(image)
+        if np.issubdtype(arr.dtype, np.floating):
+            r = np.rint(arr)
+            if not np.array_equal(r, arr):
+                raise ValueError("non-integer sample values; quantize before compressing")
+            arr = r
+        return self.codec.compress(arr.astype(np.int64))
 
     def decompress(self, blob: bytes, as_torch: bool = False):
         out = self.codec.decompress(blob)

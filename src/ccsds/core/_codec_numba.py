@@ -85,7 +85,7 @@ def _kparam(sigma, gamma, D):
 
 
 @njit
-def _kernel(encode, mode, delta_arr, image, body, buf, spp, recon, cdiff,
+def _kernel(encode, mode, delta_arr, image, body, nbits, buf, spp, recon, cdiff,
             Nz, Ny, Nx, D, P, full, lst, Omega, R, do_mod,
             Theta, phi, psi, abs_lim, rel_lim, abs_used, rel_used,
             vmin, vmax, tinc, zexp,
@@ -221,6 +221,8 @@ def _kernel(encode, mode, delta_arr, image, body, buf, spp, recon, cdiff,
                                     buf[pos >> 3] |= (1 << (7 - (pos & 7)))
                                 pos += 1
                 else:
+                    if mode == 0 and pos >= nbits:              # body ran out: truncated
+                        return -1
                     if mode != 0:                               # delta-consume (hybrid)
                         delta = delta_arr[z, y, x]
                     elif t == 0:
@@ -366,11 +368,16 @@ def run_numba(codec, encode: bool, image=None, body=None):
     if encode:
         img = np.ascontiguousarray(image, dtype=np.int64)
         buf = np.zeros((Nz * Ny * Nx * (p.u_max + D)) // 8 + 64, dtype=np.uint8)
-        nbits = _kernel(1, 0, none_delta, img, np.zeros(1, np.uint8), buf, spp, recon, cdiff, *args)
+        nbits = _kernel(1, 0, none_delta, img, np.zeros(1, np.uint8), 0,
+                        buf, spp, recon, cdiff, *args)
         return bytes(buf[:(nbits + 7) // 8])
-    body_arr = np.frombuffer(body, dtype=np.uint8).copy()
-    _kernel(0, 0, none_delta, np.zeros((1, 1, 1), np.int64), body_arr,
-            np.zeros(1, np.uint8), spp, recon, cdiff, *args)
+    nbits = 8 * len(body)
+    body_arr = np.concatenate([np.frombuffer(body, dtype=np.uint8),
+                               np.full(64, 0xFF, np.uint8)])   # bounds one sample's overrun
+    pos = _kernel(0, 0, none_delta, np.zeros((1, 1, 1), np.int64), body_arr, nbits,
+                  np.zeros(1, np.uint8), spp, recon, cdiff, *args)
+    if pos < 0 or pos > nbits:
+        raise IndexError("truncated body")
     return recon
 
 
@@ -384,10 +391,11 @@ def run_numba_delta(codec, encode: bool, image=None, delta=None):
     if encode:
         img = np.ascontiguousarray(image, dtype=np.int64)
         delta_arr = np.zeros((Nz, Ny, Nx), dtype=np.int64)
-        _kernel(1, 1, delta_arr, img, np.zeros(1, np.uint8), dummy_buf, spp, recon, cdiff, *args)
+        _kernel(1, 1, delta_arr, img, np.zeros(1, np.uint8), 0,
+                dummy_buf, spp, recon, cdiff, *args)
         return delta_arr
     delta_arr = np.ascontiguousarray(delta, dtype=np.int64)
-    _kernel(0, 2, delta_arr, np.zeros((1, 1, 1), np.int64), np.zeros(1, np.uint8),
+    _kernel(0, 2, delta_arr, np.zeros((1, 1, 1), np.int64), np.zeros(1, np.uint8), 0,
             dummy_buf, spp, recon, cdiff, *args)
     return recon
 
@@ -454,7 +462,7 @@ def _bi_enc(delta, Nz, Ny, Nx, D, M, n_i, G, resc, sigma_init, umax,
 
 
 @njit
-def _bi_dec(body, Nz, Ny, Nx, D, M, n_i, G, resc, sigma_init, umax,
+def _bi_dec(body, nbits, Nz, Ny, Nx, D, M, n_i, G, resc, sigma_init, umax,
             periodic, u, au, ru, da, dr, DA, DR, out, got_abs, got_rel):
     pos = 0
     sigma = sigma_init.copy()
@@ -463,6 +471,8 @@ def _bi_dec(body, Nz, Ny, Nx, D, M, n_i, G, resc, sigma_init, umax,
             pi = y >> u
             if au == 1:
                 for zz in range(Nz if da == 1 else 1):
+                    if pos + DA > nbits:
+                        return -1
                     v = 0
                     for _ in range(DA):
                         v = (v << 1) | ((body[pos >> 3] >> (7 - (pos & 7))) & 1)
@@ -470,6 +480,8 @@ def _bi_dec(body, Nz, Ny, Nx, D, M, n_i, G, resc, sigma_init, umax,
                     got_abs[pi, zz] = v
             if ru == 1:
                 for zz in range(Nz if dr == 1 else 1):
+                    if pos + DR > nbits:
+                        return -1
                     v = 0
                     for _ in range(DR):
                         v = (v << 1) | ((body[pos >> 3] >> (7 - (pos & 7))) & 1)
@@ -483,6 +495,8 @@ def _bi_dec(body, Nz, Ny, Nx, D, M, n_i, G, resc, sigma_init, umax,
             for x in range(Nx):
                 t = y * Nx + x
                 for z in range(z0, z1):
+                    if pos >= nbits:                    # body ran out: truncated
+                        return -1
                     if t == 0:
                         d = 0
                         for _ in range(D):
@@ -566,19 +580,26 @@ def decode_bi_numba(codec, body):
     p = codec.p
     Nz, Ny, Nx, D, M, n_i, G, resc, sinit, umax = _bi_setup(codec)
     out = np.zeros((Nz, Ny, Nx), np.int64)
-    body_arr = np.frombuffer(body, np.uint8).copy()
+    nbits = 8 * len(body)
+    body_arr = np.concatenate([np.frombuffer(body, np.uint8),
+                               np.full(64, 0xFF, np.uint8)])   # bounds one sample's overrun
     if not p.periodic:
         dummy = np.zeros((1, Nz), np.int64)
-        _bi_dec(body_arr, Nz, Ny, Nx, D, M, n_i, G, resc, sinit, umax,
-                0, 0, 0, 0, 0, 0, 0, 0, out, dummy, dummy)
+        pos = _bi_dec(body_arr, nbits, Nz, Ny, Nx, D, M, n_i, G, resc, sinit, umax,
+                      0, 0, 0, 0, 0, 0, 0, 0, out, dummy, dummy)
+        if pos < 0 or pos > nbits:
+            raise IndexError("truncated body")
         return out, None, None, 0
     u = p.update_period_exp
     au, ru, da, dr, DA, DR = codec._limit_layout()
     nper = (Ny + (1 << u) - 1) >> u
     got_abs = np.zeros((nper, Nz), np.int64)
     got_rel = np.zeros((nper, Nz), np.int64)
-    _bi_dec(body_arr, Nz, Ny, Nx, D, M, n_i, G, resc, sinit, umax,
-            1, u, int(au), int(ru), int(da), int(dr), int(DA), int(DR), out, got_abs, got_rel)
+    pos = _bi_dec(body_arr, nbits, Nz, Ny, Nx, D, M, n_i, G, resc, sinit, umax,
+                  1, u, int(au), int(ru), int(da), int(dr), int(DA), int(DR),
+                  out, got_abs, got_rel)
+    if pos < 0 or pos > nbits:
+        raise IndexError("truncated body")
     pa = (([[int(got_abs[pp, z]) for z in range(Nz)] for pp in range(nper)] if da
            else [int(got_abs[pp, 0]) for pp in range(nper)]) if au else [0] * nper)
     pr = (([[int(got_rel[pp, z]) for z in range(Nz)] for pp in range(nper)] if dr

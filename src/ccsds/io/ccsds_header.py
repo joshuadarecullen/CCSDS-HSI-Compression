@@ -371,7 +371,10 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
         ref_int = u.r(12) or 4096
         entropy_coder = "block_adaptive"
     else:
-        u_max = u.r(5); u_max = u_max if u_max >= 8 else 32
+        u_max = u.r(5)                          # Umax is 8..32 mod 32 (5.4.3.2.2.2)
+        if 0 < u_max < 8:
+            raise ValueError(f"invalid Unary Length Limit field {u_max}")
+        u_max = u_max or 32
         gamma_star = u.r(3) + 4
         gamma0 = u.r(3); gamma0 = gamma0 if gamma0 != 0 else 8
         if ect == 1:                            # hybrid (table 5-14)
