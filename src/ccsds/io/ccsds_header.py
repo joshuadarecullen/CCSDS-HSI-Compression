@@ -9,11 +9,11 @@ Field widths follow 5.3 exactly. Covers the parts this codec emits:
   * Predictor Metadata, Primary (table 5-6) + Weight Tables (table 5-7: custom
     weight initialization and weight exponent offsets) + Quantization (tables
     5-8..5-11, near-lossless) + Sample Representative (table 5-12, Theta > 0)
-  * Entropy Coder Metadata (table 5-13 sample-adaptive / 5-14 hybrid)
+  * Entropy Coder Metadata (tables 5-13/5-14/5-15)
 
-Out of scope: the block-adaptive entropy coder and streams whose weight exponent
-offsets, accumulator init or damping/offset values are mission-defined rather
-than carried in a header table; parse_header rejects both.
+Out of scope: streams whose weight exponent offsets, accumulator init or
+damping/offset values are mission-defined rather than carried in a header
+table; parse_header rejects them.
 """
 
 from __future__ import annotations
@@ -86,6 +86,7 @@ def pack_header(p) -> bytes:
     fc = 0 if p.lossless else (3 if (au and ru) else 1 if au else 2)
     bi = getattr(p, "encoding_order", "BSQ") == "BI"
     periodic = getattr(p, "periodic", False)
+    coder = getattr(p, "entropy_coder", "sample_adaptive")
 
     bp = _BitPacker()
     # Image Metadata, Essential (table 5-3)
@@ -102,7 +103,7 @@ def pack_header(p) -> bytes:
     bp.w(M & 0xFFFF, 16)                         # Sub-Frame Interleaving Depth (M for BI)
     bp.w(0, 2)                                  # Reserved
     bp.w(getattr(p, "output_word_size", 1) & 0x7, 3)   # Output Word Size (B mod 8)
-    bp.w(1 if getattr(p, "entropy_coder", "sample_adaptive") == "hybrid" else 0, 2)  # Entropy Coder Type
+    bp.w({"sample_adaptive": 0, "hybrid": 1, "block_adaptive": 2}[coder], 2)  # Entropy Coder Type
     bp.w(0, 1)                                  # Reserved
     bp.w(fc, 2)                                 # Quantizer Fidelity Control Method
     tables = getattr(p, "supplementary_tables", None) or []
@@ -192,11 +193,18 @@ def pack_header(p) -> bytes:
                     bp.w(int(v), p.theta)
                 bp.align()
 
-    # Entropy Coder Metadata (table 5-13 sample-adaptive / 5-14 hybrid)
+    # Entropy Coder Metadata (tables 5-13/5-14/5-15)
+    if coder == "block_adaptive":
+        bp.w(0, 1)                              # Reserved
+        bp.w({8: 0, 16: 1, 32: 2, 64: 3}[p.block_size], 2)   # Block Size J
+        bp.w(1 if p.restricted else 0, 1)       # Restricted Code Options Flag
+        bp.w(p.ref_sample_interval & 0xFFF, 12)  # Reference Sample Interval (r mod 2^12)
+        bp.align()
+        return bp.to_bytes()
     bp.w(p.u_max & 0x1F, 5)                     # Unary Length Limit (Umax mod 32)
     bp.w((p.gamma_star - 4) & 0x7, 3)           # Rescaling Counter Size
     bp.w(p.gamma0 & 0x7, 3)                     # Initial Count Exponent
-    if getattr(p, "entropy_coder", "sample_adaptive") == "hybrid":
+    if coder == "hybrid":
         bp.w(0, 5)                              # Reserved (table 5-14)
     else:
         table = isinstance(p.k_init, list)      # Accumulator Initialization Table (5.3.4.2.2)
@@ -228,9 +236,8 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
     order_bit = u.r(1)                          # Sample Encoding Order: 0=BI, 1=BSQ
     M_field = u.r(16)                           # Sub-Frame Interleaving Depth
     u.r(2); B = u.r(3) or 8; ect = u.r(2); u.r(1)   # Reserved, Output Word Size, Entropy Coder Type, Reserved
-    if ect > 1:                                 # '10' block-adaptive / '11' reserved (table 5-3)
-        raise ValueError(f"unsupported Entropy Coder Type {ect} "
-                         "(only sample-adaptive (0) and hybrid (1) are implemented)")
+    if ect == 3:
+        raise ValueError("reserved Entropy Coder Type '11'")
     fc = u.r(2)                                 # Quantizer Fidelity Control Method
     u.r(2); tau = u.r(4)                        # Reserved, Supplementary Information Table Count
 
@@ -354,26 +361,34 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
             psi = [u.r(theta) for _ in range(Nz)]
             u.align()
 
-    # Entropy Coder Metadata
-    u_max = u.r(5); u_max = u_max if u_max >= 8 else 32
-    gamma_star = u.r(3) + 4
-    gamma0 = u.r(3); gamma0 = gamma0 if gamma0 != 0 else 8
-    if ect == 1:                                # hybrid (table 5-14)
-        u.r(5)                                  # Reserved
-        k_init = 0                              # unused by the hybrid coder; 0 validates for any D
-        entropy_coder = "hybrid"
-    else:                                       # sample-adaptive (table 5-13)
-        k_init = u.r(4)
-        if u.r(1):                              # Accumulator Initialization Table Flag
-            if k_init != 15:
-                raise ValueError("Accumulator Initialization Table alongside a constant K")
-            k_init = [u.r(4) for _ in range(Nz)]
-            u.align()
-        elif k_init == 15:
-            raise NotImplementedError(
-                "accumulator initialization without a table cannot be decoded "
-                "(per-band values are mission-defined)")
-        entropy_coder = "sample_adaptive"
+    # Entropy Coder Metadata (tables 5-13/5-14/5-15)
+    u_max, gamma_star, gamma0, k_init = 18, 6, 1, 0
+    block_size, ref_int, restricted = 64, 4096, False
+    if ect == 2:                                # block-adaptive (table 5-15)
+        u.r(1)
+        block_size = 8 << u.r(2)
+        restricted = u.r(1) == 1
+        ref_int = u.r(12) or 4096
+        entropy_coder = "block_adaptive"
+    else:
+        u_max = u.r(5); u_max = u_max if u_max >= 8 else 32
+        gamma_star = u.r(3) + 4
+        gamma0 = u.r(3); gamma0 = gamma0 if gamma0 != 0 else 8
+        if ect == 1:                            # hybrid (table 5-14)
+            u.r(5)                              # Reserved
+            entropy_coder = "hybrid"            # k_init unused; 0 validates for any D
+        else:                                   # sample-adaptive (table 5-13)
+            k_init = u.r(4)
+            if u.r(1):                          # Accumulator Initialization Table Flag
+                if k_init != 15:
+                    raise ValueError("Accumulator Initialization Table alongside a constant K")
+                k_init = [u.r(4) for _ in range(Nz)]
+                u.align()
+            elif k_init == 15:
+                raise NotImplementedError(
+                    "accumulator initialization without a table cannot be decoded "
+                    "(per-band values are mission-defined)")
+            entropy_coder = "sample_adaptive"
 
     u.align()
     params = dict(
@@ -387,6 +402,7 @@ def parse_header(data: bytes) -> Tuple[Dict, int]:
         v_min=v_min, v_max=v_max, t_inc=t_inc,
         gamma0=gamma0, gamma_star=gamma_star, u_max=u_max, k_init=k_init,
         entropy_coder=entropy_coder,
+        block_size=block_size, ref_sample_interval=ref_int, restricted=restricted,
         user_data=user_data, output_word_size=B,
         encoding_order=("BI" if bi else "BSQ"),
         interleave_depth=(M_field if bi else 0),

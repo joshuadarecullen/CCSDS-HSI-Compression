@@ -207,22 +207,22 @@ def test_low_dynamic_range():
 
 
 def test_header_edge_cases():
-    """Header sizes are stored mod 2^16 (0 means 65536); block-adaptive streams
-    must be rejected, not misparsed as sample-adaptive."""
+    """Header sizes are stored mod 2^16 (0 means 65536); the reserved coder type
+    must be rejected, not misparsed."""
     p = CodecParams(num_bands=2, height=4, width=1 << 16)
     parsed, _ = rc.parse_header(rc.pack_header(p))
     assert parsed["width"] == 1 << 16, f"width 65536 parsed as {parsed['width']}"
     hdr = bytearray(rc.pack_header(CodecParams(num_bands=2, height=4, width=4)))
-    hdr[10] |= 0x04                                   # Entropy Coder Type bits 85-86 -> '10'
+    hdr[10] |= 0x06                                   # Entropy Coder Type bits 85-86 -> '11'
     assert _raises(ValueError, rc.parse_header, bytes(hdr)), \
-        "block-adaptive coder type must raise, not misparse"
+        "reserved coder type must raise, not misparse"
     # DA=16 boundary: the 4-bit header field wraps to 0 and must parse back as 16
     p16 = CodecParams(num_bands=2, height=4, width=4, dynamic_range=24,
                       absolute_error_limit=(1 << 16) - 1)
     parsed, _ = rc.parse_header(rc.pack_header(p16))
     assert parsed["absolute_error_limit"] == (1 << 16) - 1, \
         f"DA=16 limit parsed as {parsed['absolute_error_limit']}"
-    print("  header edge cases: 65536-size inversion + block-adaptive rejection + DA=16 wrap OK")
+    print("  header edge cases: 65536-size inversion + reserved coder rejection + DA=16 wrap OK")
 
 
 def test_ndarray_error_limits():
@@ -781,6 +781,45 @@ def test_output_word_size():
     print("  output word size: B=3/8 padding for all three coder paths + user data OK")
 
 
+def test_block_adaptive():
+    """Block-adaptive entropy coder (5.4.3.4 / CCSDS-121): all block sizes, zero-run
+    and ROS paths, restricted options, BI and periodic; decoded through the header."""
+    img = cube(6, 16, 16)
+    base = dict(num_bands=6, height=16, width=16, dynamic_range=16,
+                entropy_coder="block_adaptive")
+    for J in (8, 16, 32, 64):
+        blob = Ccsds123(CodecParams(**base, block_size=J)).compress(img)
+        assert np.array_equal(img, Ccsds123.decompress_standalone(blob)), f"J={J}"
+        parsed, _ = rc.parse_header(blob)
+        assert parsed["entropy_coder"] == "block_adaptive" and parsed["block_size"] == J
+    # constant image: long zero-block runs incl. ROS; small r resets segments
+    flat = np.full((6, 16, 16), 777, np.int64)
+    for r in (2, 4096):
+        blob = Ccsds123(CodecParams(**base, block_size=8, ref_sample_interval=r)).compress(flat)
+        assert np.array_equal(flat, Ccsds123.decompress_standalone(blob)), f"r={r}"
+    # both option sets at D=4
+    img4 = img >> 12
+    for restricted in (False, True):
+        p = CodecParams(num_bands=6, height=16, width=16, dynamic_range=4,
+                        entropy_coder="block_adaptive", block_size=16, restricted=restricted)
+        blob = Ccsds123(p).compress(img4)
+        assert np.array_equal(img4, Ccsds123.decompress_standalone(blob))
+        assert rc.parse_header(blob)[0]["restricted"] is restricted
+    # BI with the periodic limit values in the input sequence
+    u = 2
+    abs_bi = [p % 4 for p in range((16 + 3) >> 2)]
+    out, st = _roundtrip(img, entropy_coder="block_adaptive", block_size=16,
+                         encoding_order="BI", interleave_depth=2,
+                         update_period_exp=u, absolute_error_limit=abs_bi)
+    for y in range(16):
+        e = int(np.abs(img[:, y, :] - out[:, y, :]).max())
+        assert e <= abs_bi[y >> u], f"row {y}: err {e} > {abs_bi[y >> u]}"
+    assert _raises(AssertionError, Ccsds123, CodecParams(**base, block_size=12))
+    assert _raises(AssertionError, Ccsds123, CodecParams(**base, restricted=True))
+    print(f"  block-adaptive coder: J=8/16/32/64, zero runs, restricted, BI+periodic OK  "
+          f"ratio={st['ratio']:.3f}:1")
+
+
 def test_sample_rep_phi():
     """Exercise the full Eq (47) sample-representative path (phi != 0)."""
     img = cube(16, 24, 24)
@@ -919,6 +958,7 @@ if __name__ == "__main__":
                test_bi_order, test_periodic_error_limits, test_hybrid_bi,
                test_bi_numba_identical, test_accumulator_init_table,
                test_band_varying_sample_rep, test_hybrid_sigma_init, test_output_word_size,
+               test_block_adaptive,
                test_lossless_crop, test_reduced_mode,
                test_sample_rep_phi, test_sample_rep_psi, test_narrow_local_sums,
                test_column_local_sums, test_high_dynamic_range_and_signed,
