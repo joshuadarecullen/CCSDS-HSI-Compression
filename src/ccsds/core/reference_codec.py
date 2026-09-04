@@ -47,6 +47,12 @@ try:
 except ImportError:
     HybridCoder = _load_sibling("hybrid", "..", "entropy", "hybrid.py").HybridCoder
 
+try:
+    from ..entropy.block_adaptive import BlockAdaptiveCoder
+except ImportError:
+    BlockAdaptiveCoder = _load_sibling(
+        "block_adaptive", "..", "entropy", "block_adaptive.py").BlockAdaptiveCoder
+
 
 def _clip(v: int, lo: int, hi: int) -> int:
     if v < lo:
@@ -174,7 +180,12 @@ class CodecParams:
     hybrid_sigma_init: object = None
 
     # entropy coder selection
-    entropy_coder: str = "sample_adaptive"   # 'sample_adaptive' | 'hybrid'
+    entropy_coder: str = "sample_adaptive"   # 'sample_adaptive' | 'hybrid' | 'block_adaptive'
+
+    # block-adaptive coder (5.4.3.4 / CCSDS-121)
+    block_size: int = 64             # J (8/16/32/64)
+    ref_sample_interval: int = 4096  # r (1..4096, encoded mod 2^12)
+    restricted: bool = False         # restricted code options (D <= 4 only)
 
     # framing (5.2.2 / table 5-3)
     user_data: int = 0               # User-Defined Data header byte
@@ -306,7 +317,11 @@ class CodecParams:
             f"k_init {self.k_init} outside 0..min(D-2,14); use k_init=None to derive it from D"
         if isinstance(self.k_init, list):
             assert len(self.k_init) == self.num_bands, "per-band k_init needs num_bands entries"
-        assert self.entropy_coder in ("sample_adaptive", "hybrid")
+        assert self.entropy_coder in ("sample_adaptive", "hybrid", "block_adaptive")
+        assert self.block_size in (8, 16, 32, 64)
+        assert 1 <= self.ref_sample_interval <= 4096
+        if self.restricted:
+            assert D <= 4, "restricted code options require D <= 4"
         assert self.encoding_order in ("BSQ", "BI")
         if self.encoding_order == "BI":
             M = self.interleave_depth or self.num_bands
@@ -893,6 +908,57 @@ class Ccsds123:
             return delta_out if collect_delta else writer.to_bytes()
         return recon
 
+    # block-adaptive coder I/O: the full input sequence (5.4.2) as a flat array,
+    # periodic limit values inline at row starts
+    def _seq_pack(self, delta, pa=None, pr=None, u=0):
+        p = self.p
+        if p.encoding_order != "BI":
+            return delta.reshape(-1)
+        Nz, Ny, Nx = delta.shape
+        M, n_i = self._bi_blocks()
+        lay = self._limit_layout() if pa is not None else None
+        out = []
+        for y in range(Ny):
+            if pa is not None and y % (1 << u) == 0:
+                pi = y >> u
+                au, ru, da, dr, _, _ = lay
+                for used, dep, vals in ((au, da, pa), (ru, dr, pr)):
+                    if used:
+                        out.extend(vals[pi] if dep else [vals[pi]])
+            for i in range(n_i):
+                for x in range(Nx):
+                    for z in range(i * M, min((i + 1) * M, Nz)):
+                        out.append(int(delta[z, y, x]))
+        return np.asarray(out, dtype=np.int64)
+
+    def _seq_unpack(self, vals):
+        """Inverse of _seq_pack: -> (delta, period_abs, period_rel)."""
+        p = self.p
+        Nz, Ny, Nx = p.num_bands, p.height, p.width
+        if p.encoding_order != "BI":
+            return vals.reshape(Nz, Ny, Nx).copy(), None, None
+        M, n_i = self._bi_blocks()
+        delta = np.zeros((Nz, Ny, Nx), np.int64)
+        got_a = got_r = None
+        if p.periodic:
+            pa0, pr0, u = self._period_arrays()
+            got_a, got_r = [0] * len(pa0), [0] * len(pr0)
+            au, ru, da, dr, _, _ = self._limit_layout()
+        pos = 0
+        for y in range(Ny):
+            if p.periodic and y % (1 << u) == 0:
+                pi = y >> u
+                for used, dep, got in ((au, da, got_a), (ru, dr, got_r)):
+                    if used:
+                        got[pi] = [int(v) for v in vals[pos:pos + Nz]] if dep else int(vals[pos])
+                        pos += Nz if dep else 1
+            for i in range(n_i):
+                for x in range(Nx):
+                    for z in range(i * M, min((i + 1) * M, Nz)):
+                        delta[z, y, x] = vals[pos]
+                        pos += 1
+        return delta, got_a, got_r
+
     # public API
     def _hybrid(self):
         if getattr(self, "_hybrid_coder", None) is None:          # cache (flattened tables reused)
@@ -900,6 +966,21 @@ class Ccsds123:
             self._hybrid_coder = HybridCoder(p.dynamic_range, p.gamma0, p.gamma_star, p.u_max,
                                              sigma_init=p.hybrid_sigma_init)
         return self._hybrid_coder
+
+    def _block_adaptive(self):
+        p = self.p
+        return BlockAdaptiveCoder(p.dynamic_range, p.block_size,
+                                  p.ref_sample_interval, p.restricted)
+
+    def _seq_len(self) -> int:
+        """Entropy coder input sequence length (samples + periodic limit values)."""
+        p = self.p
+        n = p.num_bands * p.height * p.width
+        if p.periodic:
+            au, ru, da, dr, _, _ = self._limit_layout()
+            nper = (p.height + (1 << p.update_period_exp) - 1) >> p.update_period_exp
+            n += nper * ((p.num_bands if da else 1) * au + (p.num_bands if dr else 1) * ru)
+        return n
 
     def compress(self, image: np.ndarray) -> bytes:
         """Compress a [Z, Y, X] integer image to a CCSDS-123 header + body byte string."""
@@ -923,6 +1004,16 @@ class Ccsds123:
             else:
                 delta = self._run(encode=True, image=img, collect_delta=True)
                 body = self._hybrid().encode(delta, M)
+        elif p.entropy_coder == "block_adaptive":           # predictor -> input sequence -> 121 coder
+            if p.periodic:
+                pa, pr, uu = self._period_arrays()
+                delta = self._run(encode=True, image=img, collect_delta=True,
+                                  period_abs=pa, period_rel=pr, u_period=uu)
+                seq = self._seq_pack(delta, pa, pr, uu)
+            else:
+                delta = self._run(encode=True, image=img, collect_delta=True)
+                seq = self._seq_pack(delta)
+            body = self._block_adaptive().encode(seq)
         elif p.encoding_order == "BI":                      # predictor -> mapped indices -> BI coder
             if p.periodic:
                 pa, pr, u = self._period_arrays()
@@ -953,6 +1044,13 @@ class Ccsds123:
                 return self._run(encode=False, delta_in=delta,
                                  period_abs=pa, period_rel=pr, u_period=uu)
             delta = self._hybrid().decode(body, shape, M)
+            return self._run(encode=False, delta_in=delta)
+        if p.entropy_coder == "block_adaptive":
+            vals = self._block_adaptive().decode(body, self._seq_len())
+            delta, pa, pr = self._seq_unpack(vals)
+            if pa is not None:
+                return self._run(encode=False, delta_in=delta, period_abs=pa,
+                                 period_rel=pr, u_period=p.update_period_exp)
             return self._run(encode=False, delta_in=delta)
         if p.encoding_order == "BI":
             delta, pa, pr, u = self._decode_bi(body)

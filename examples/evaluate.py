@@ -60,8 +60,8 @@ def main():
     ap.add_argument("--dynamic-range", type=int, default=16, help="sample bit depth D")
     ap.add_argument("--order", choices=["BSQ", "BI"], default="BSQ", help="encoding order")
     ap.add_argument("--pred-bands", type=int, default=3, help="number of prediction bands P (0..15)")
-    ap.add_argument("--entropy", choices=["sample_adaptive", "hybrid"],
-                    default="sample_adaptive", help="entropy coder (hybrid needs BSQ order)")
+    ap.add_argument("--entropy", choices=["sample_adaptive", "hybrid", "block_adaptive"],
+                    default="sample_adaptive", help="entropy coder")
     ap.add_argument("--peak", choices=["full", "data"], default="full",
                     help="PSNR peak: full = 2^D-1 (default), data = the cube's actual maximum")
     ap.add_argument("--bands", type=int, default=100, help="synthetic-fallback band count")

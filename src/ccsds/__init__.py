@@ -4,7 +4,7 @@
 and `CodecParams` are the pure-integer reference codec underneath.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 from .core.reference_codec import Ccsds123, CodecParams
 from .codec import CCSDS123

@@ -74,19 +74,18 @@ out["reconstruction"], out["bpppb"]
 - **Encoding order** (5.4.2): BSQ (default) or band-interleaved (BI: BIP, BIL, or an
   intermediate sub-frame depth M), with optional **periodic error-limit updating**
   (4.8.2.4) that carries per-period limits in the body.
-- **Two entropy coders**, in either encoding order: sample-adaptive (5.4.3.2,
-  default; constant or per-band accumulator init) and hybrid (5.4.3.3,
+- **Three entropy coders**, in either encoding order: sample-adaptive (5.4.3.2,
+  default; constant or per-band accumulator init), hybrid (5.4.3.3,
   `entropy_coder="hybrid"`) with the real annex-B low-entropy tables,
-  reverse-order suffix-free decoding and user-set initial accumulators.
+  reverse-order suffix-free decoding and user-set initial accumulators, and
+  block-adaptive (5.4.3.4, the CCSDS-121 coder with basic or restricted options).
 - **Bit-exact CCSDS 5.3 header** (`io/ccsds_header.py`): packs/parses every supported
   parameter, including supplementary information tables (3.5), the user data byte
   and output word size B; the default lossless header is 19 bytes.
 
-Not implemented: the block-adaptive entropy coder (5.4.3.4 / CCSDS-121).
-
 The encoder is cross-validated byte-for-byte against the independent
 [NTNU verification model](https://github.com/NTNU-SmallSat-Lab/ccsds123_issue_2_verification_model)
-over 32 configurations (`tools/crossval_ntnu.py`); the NTNU model is itself
+over 37 configurations (`tools/crossval_ntnu.py`); the NTNU model is itself
 verified against the official CCSDS test vector set.
 
 ## Layout
@@ -100,6 +99,7 @@ src/ccsds/
   core/_codec_numba.py     numba kernel (byte-identical fast path)
   entropy/hybrid.py        hybrid entropy coder (5.4.3.3)
   entropy/_hybrid_numba.py numba hybrid kernels
+  entropy/block_adaptive.py block-adaptive coder (5.4.3.4 / CCSDS-121)
   entropy/annexb_tables.json   annex-B low-entropy code tables
   io/ccsds_header.py       CCSDS 5.3 header pack/parse
 tests/

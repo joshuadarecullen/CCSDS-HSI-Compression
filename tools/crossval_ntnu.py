@@ -167,6 +167,20 @@ def main() -> int:
         ("wordsize_hyb", img, dict(**base, output_word_size=5, user_data=9,
                                    entropy_coder="hybrid")),
     ]
+    # block-adaptive coder (5.4.3.4 / CCSDS-121)
+    ba = dict(**base, entropy_coder="block_adaptive")
+    base4 = dict(num_bands=5, height=20, width=24, dynamic_range=4,
+                 entropy_coder="block_adaptive")
+    configs += [
+        ("ba_j16", img, dict(**ba, block_size=16)),
+        ("ba_j64_bil", img, dict(**ba, block_size=64, encoding_order="BI",
+                                 interleave_depth=1, absolute_error_limit=2)),
+        ("ba_zeros", np.full_like(img, 900), dict(**ba, block_size=8, ref_sample_interval=2)),
+        ("ba_restricted", img >> 10, dict(**base4, block_size=16, restricted=True)),
+        ("ba_periodic", img, dict(**ba, block_size=32, encoding_order="BI",
+                                  update_period_exp=3, absolute_error_limit=[2, 0, 1],
+                                  relative_error_limit=[[16, 8, 24, 4, 12]] * 3)),
+    ]
 
     results = {}
     with tempfile.TemporaryDirectory(prefix="ccsds_crossval_") as work:

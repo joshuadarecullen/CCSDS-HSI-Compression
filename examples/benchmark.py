@@ -59,7 +59,7 @@ def main():
     ap.add_argument("--out", default="benchmark.csv", help="output CSV path")
     ap.add_argument("--datasets", nargs="+", help="only these dataset names")
     ap.add_argument("--coders", nargs="+", default=["sample_adaptive", "hybrid"],
-                    choices=["sample_adaptive", "hybrid"])
+                    choices=["sample_adaptive", "hybrid", "block_adaptive"])
     ap.add_argument("--limits", type=int, nargs="+", default=[0, 2, 4, 8, 16],
                     help="absolute error limits (0 = lossless)")
     ap.add_argument("--pred-bands", type=int, default=15)
