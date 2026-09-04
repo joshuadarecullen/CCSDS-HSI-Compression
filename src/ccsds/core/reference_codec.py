@@ -337,20 +337,31 @@ class CodecParams:
             if self.rel_limit_used:
                 assert self.relative_error_limit != 0, \
                     "rel_limit_used=True requires per-period relative error-limit lists"
+            if self.abs_limit_used is not None and not self.abs_limit_used:
+                assert self.absolute_error_limit == 0, \
+                    "abs_limit_used=False conflicts with absolute error-limit lists"
+            if self.rel_limit_used is not None and not self.rel_limit_used:
+                assert self.relative_error_limit == 0, \
+                    "rel_limit_used=False conflicts with relative error-limit lists"
             nper = (self.height + (1 << self.update_period_exp) - 1) >> self.update_period_exp
             for lim in (self.absolute_error_limit, self.relative_error_limit):
                 if lim != 0:
                     assert isinstance(lim, (list, tuple)), \
                         "periodic error limits must be per-period lists, not scalars"
                     assert len(lim) == nper, f"periodic error-limit list must have length {nper}"
+                    dep = isinstance(lim[0], (list, tuple))
                     for v in lim:
-                        if isinstance(v, (list, tuple)):
+                        assert isinstance(v, (list, tuple)) == dep, \
+                            "period entries must be uniformly scalar or per-band"
+                        if dep:
                             assert len(v) == self.num_bands, "band-dependent period entry needs num_bands values"
         else:
             for lim in (self.absolute_error_limit, self.relative_error_limit):
                 if isinstance(lim, (list, tuple)):
                     assert len(lim) == self.num_bands, \
                         "per-band error-limit list must have length num_bands"
+                    assert not any(isinstance(v, (list, tuple)) for v in lim), \
+                        "per-period nested lists require periodic updating"
             if self.abs_limit_used is not None and not self.abs_limit_used:
                 assert self._limit_max(self.absolute_error_limit) == 0, \
                     "abs_limit_used=False conflicts with a nonzero absolute_error_limit"

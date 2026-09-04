@@ -56,9 +56,21 @@ otherwise):
 
 ```python
 from ccsds import CCSDS123Module
-out = CCSDS123Module(dynamic_range=14)(x)   # x: [Z, Y, X] or [B, Z, Y, X] int tensor
-out["reconstruction"], out["bpppb"]
+
+m = CCSDS123Module(dynamic_range=14, entropy_coder="hybrid", num_workers=4)
+
+out = m(x)                       # x: [Z, Y, X] or [B, Z, Y, X] int tensor
+out["reconstruction"]            # same shape, dtype and device as x
+out["bpppb"], out["bits"]        # rate, per batch item
+
+out = m(x, absolute_error_limit=4)          # any CodecParams field, per call
+blobs = m.compress(x)                       # one decodable byte string per item
+rec = CCSDS123Module.decompress(blobs, dtype=x.dtype)
+m.codec_for(x.shape[-3:]).params            # the CodecParams in use
 ```
+
+`num_workers` spreads a batch over processes; `straight_through=True` makes the
+reconstruction pass gradients unchanged.
 
 ## What it implements
 
@@ -100,6 +112,7 @@ src/ccsds/
   entropy/hybrid.py        hybrid entropy coder (5.4.3.3)
   entropy/_hybrid_numba.py numba hybrid kernels
   entropy/block_adaptive.py block-adaptive coder (5.4.3.4 / CCSDS-121)
+  entropy/_block_adaptive_numba.py numba block-adaptive kernels
   entropy/annexb_tables.json   annex-B low-entropy code tables
   io/ccsds_header.py       CCSDS 5.3 header pack/parse
 tests/
@@ -138,9 +151,10 @@ error limit of ~44 (every sample then within ±44 of the original).
 
 ## Benchmark
 
-Whole-cube results across 14 standard HSI scenes (`examples/benchmark.py`, hybrid coder).
-Each scene is the raw integer DN cube; near-lossless bounds the per sample error exactly by
-the limit, and PSNR is reported against each scene's data peak.
+Whole-cube results across 14 standard HSI scenes (`examples/benchmark.py`, all three
+entropy coders). Each scene is the raw integer DN cube; near-lossless bounds the per sample
+error exactly by the limit, and PSNR is reported against each scene's data peak. The
+rate-distortion plots and the table below are the hybrid coder.
 
 ![Rate-distortion](assets/rate_distortion.png)
 
@@ -148,9 +162,11 @@ the limit, and PSNR is reported against each scene's data peak.
 
 ![Lossless ratio by dataset](assets/lossless_ratio.png)
 
-Lossless is **1.77-4.21:1** (median ~2:1). Near-lossless scales much further. Salinas reaches
+Lossless is **1.77-4.24:1** (median ~2:1). Near-lossless scales much further. Salinas reaches
 **54:1** at an error limit of 64. The hybrid coder ties sample adaptive when lossless but pulls
 well ahead as the limit grows (it packs the mostly-zero residuals into sub-1-bit codes).
+Block adaptive is the opposite trade: it edges ahead on 6 of the 14 scenes when lossless
+(ksc **3.52:1** against hybrid's 3.27) and slips to ~0.82x hybrid by an error limit of 64.
 
 | dataset | bands | D | lossless | a=4 | a=16 | a=64 |
 |---|--:|--:|--:|--:|--:|--:|
@@ -188,7 +204,8 @@ Reproduce (reads `<dataset>/zarr/cube.zarr`, needs `zarr`; non-integer/normalise
 auto-skipped. Here `samson` was skipped as normalised and the 752M-sample `chikusei` by size):
 
 ```bash
-python3 examples/benchmark.py --root <data-dir> --out assets/benchmark_local.csv
+python3 examples/benchmark.py --root <data-dir> --out assets/benchmark_local.csv \
+    --coders sample_adaptive hybrid block_adaptive
 python3 examples/benchmark.py --root <data-dir> --coders hybrid \
     --limits 0 2 4 8 16 32 64 128 256 512 --out assets/benchmark_lowrate.csv
 python3 examples/plot_benchmark.py --csv assets/benchmark_local.csv \

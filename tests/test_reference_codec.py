@@ -181,7 +181,16 @@ def test_param_validation():
     # explicit fc flags must not contradict the limit values
     assert _raises(AssertionError, Ccsds123,
                    CodecParams(**base, absolute_error_limit=4, abs_limit_used=False))
-    print("  validate(): DA/DR bit-depth bound, size bounds, Nx=1 reduced mode, k_init defaults OK")
+    bi = dict(**base, encoding_order="BI", update_period_exp=1)
+    assert _raises(AssertionError, Ccsds123, CodecParams(**bi,          # periodic too
+                   absolute_error_limit=[1, 2, 3, 4], abs_limit_used=False))
+    # period entries must be uniformly scalar or per-band; nested lists need periodic
+    assert _raises(AssertionError, Ccsds123,
+                   CodecParams(**bi, absolute_error_limit=[3, [1, 2, 3, 4], 2, 1]))
+    assert _raises(AssertionError, Ccsds123,
+                   CodecParams(**base, absolute_error_limit=[[1, 2, 3, 4]] * 4))
+    print("  validate(): DA/DR bit-depth bound, size bounds, Nx=1 reduced mode, k_init defaults, "
+          "limit shape/flag consistency OK")
 
 
 def test_width_one_reduced_mode():
@@ -222,7 +231,13 @@ def test_header_edge_cases():
     parsed, _ = rc.parse_header(rc.pack_header(p16))
     assert parsed["absolute_error_limit"] == (1 << 16) - 1, \
         f"DA=16 limit parsed as {parsed['absolute_error_limit']}"
-    print("  header edge cases: 65536-size inversion + reserved coder rejection + DA=16 wrap OK")
+    # Umax field 1..7 is invalid (legal: 0 meaning 32, or 8..31): reject, not default
+    hdr = bytearray(rc.pack_header(CodecParams(num_bands=2, height=4, width=4)))
+    hdr[-2] = (hdr[-2] & 0x07) | 0x28                     # Umax field bits -> 5
+    assert _raises(ValueError, rc.parse_header, bytes(hdr)), \
+        "invalid Umax field must raise, not misparse"
+    print("  header edge cases: 65536-size inversion + reserved coder/Umax rejection "
+          "+ DA=16 wrap OK")
 
 
 def test_ndarray_error_limits():
@@ -248,6 +263,51 @@ def test_out_of_range_samples_rejected():
     img[0, 2, 3] = -7
     assert _raises(ValueError, codec.compress, img), "negative sample must raise (unsigned)"
     print("  out-of-range samples rejected with ValueError: OK")
+
+
+def test_truncated_stream():
+    """A truncated body must raise instead of reading past the buffer, and the numba
+    decoders must behave exactly like the pure ones on corrupt input."""
+    img = cube(4, 12, 12)
+    for coder in ("sample_adaptive", "hybrid", "block_adaptive"):
+        for order, extra in (("BSQ", {}), ("BI", {"interleave_depth": 2})):
+            p = CodecParams(num_bands=4, height=12, width=12,
+                            entropy_coder=coder, encoding_order=order, **extra)
+            blob = Ccsds123(p).compress(img)
+            hlen = rc.parse_header(blob)[1]
+            assert _raises(IndexError, Ccsds123(p).decompress, blob[:hlen]), \
+                f"{coder}/{order}: empty body must raise"
+            assert _raises(IndexError, Ccsds123(p).decompress,
+                           blob[:hlen + (len(blob) - hlen) // 2]), \
+                f"{coder}/{order}: half body must raise"
+    # coder-level: the numba decoders must agree with the pure ones bit for bit
+    rng = np.random.default_rng(4)
+    vals = rng.integers(0, 1 << 12, 4000).astype(np.int64)
+    vals[rng.random(4000) < 0.6] = 0
+    bc = rc.BlockAdaptiveCoder(12)
+    body = bc.encode(vals)
+    for cut in (0, 1, len(body) // 4, len(body) // 2, len(body) - 1):
+        got = []
+        for use_numba in (False, True):
+            bc.use_numba = use_numba and rc.BlockAdaptiveCoder(12).use_numba
+            try:
+                got.append(bc.decode(body[:cut], len(vals)).tobytes())
+            except IndexError:
+                got.append(b"raise")
+        bc.use_numba = rc.BlockAdaptiveCoder(12).use_numba
+        assert got[0] == got[1], f"block-adaptive numba differs from pure at cut={cut}"
+    print("  truncated bodies raise IndexError; numba decoders match pure on corrupt input")
+
+
+def test_float_input_integrality():
+    """The numpy front-end must reject fractional floats, not truncate them."""
+    sys.path.insert(0, os.path.join(REPO, "src"))
+    from ccsds.codec import CCSDS123
+    img = cube(3, 8, 8).astype(np.float64)
+    c = CCSDS123.from_image(img)
+    assert np.array_equal(c.decompress(c.compress(img)), img)   # integral floats fine
+    assert _raises(ValueError, c.compress, img + 0.5), "fractional input must raise"
+    print("  float input: integral accepted, fractional rejected")
 
 
 def test_ccsds_header():
@@ -425,7 +485,21 @@ def test_torch_wrapper():
     assert not torch.equal(out_st["reconstruction"].detach(), xg.detach())
     out_st["reconstruction"].sum().backward()
     assert torch.equal(xg.grad, torch.ones_like(xg)), "STE gradient must be identity"
-    print("  torch wrapper: batched lossless + near-lossless, static decode, STE grad OK")
+    # per-call overrides beat the constructor settings and cache separately
+    o = m(x, absolute_error_limit=3)
+    err = (o["reconstruction"] - x).abs().max().item()
+    assert 0 < err <= 3 and o["bitstreams"] != out["bitstreams"]
+    assert torch.equal(m(x)["reconstruction"], x), "override must not stick"
+    assert m.codec_for((6, 16, 16), entropy_coder="hybrid").params.entropy_coder == "hybrid"
+    o2 = m(x, entropy_coder="block_adaptive", block_size=16)
+    assert torch.equal(o2["reconstruction"], x)
+    # worker processes give the same bitstreams as the serial path
+    mp = CCSDS123Module(dynamic_range=16, num_workers=2)
+    op = mp(x)
+    assert op["bitstreams"] == out["bitstreams"] and torch.equal(op["reconstruction"], x)
+    assert mp.compress(x, absolute_error_limit=3) == o["bitstreams"]
+    print("  torch wrapper: batched lossless + near-lossless, static decode, STE grad, "
+          "per-call overrides, worker pool OK")
 
 
 def test_metrics():
@@ -820,6 +894,26 @@ def test_block_adaptive():
           f"ratio={st['ratio']:.3f}:1")
 
 
+def test_block_adaptive_numba_identical():
+    """The numba block-adaptive kernels must be byte-identical to the pure coder."""
+    if not rc.BlockAdaptiveCoder(16).use_numba:
+        _skip("numba not available (block-adaptive coder runs pure-Python)")
+        return
+    rng = np.random.default_rng(2)
+    for D, J, r, restricted in [(16, 64, 4096, False), (16, 8, 2, False),
+                                (4, 16, 3, True), (20, 32, 64, False)]:
+        bc = rc.BlockAdaptiveCoder(D, J, r, restricted)
+        for hi in (1, 3, 1 << D):               # hi=1: all zeros -> runs + ROS
+            v = rng.integers(0, hi, 1000)
+            v[rng.random(1000) < 0.5] = 0
+            v = v.astype(np.int64)
+            bc.use_numba = True;  bn = bc.encode(v); on = bc.decode(bn, len(v))
+            bc.use_numba = False; bp = bc.encode(v); op = bc.decode(bp, len(v))
+            assert bn == bp, f"block-adaptive numba bytes differ for {(D, J, r, restricted, hi)}"
+            assert np.array_equal(on, v) and np.array_equal(op, v)
+    print("  block-adaptive numba kernels BYTE-IDENTICAL to pure-Python + round-trip OK")
+
+
 def test_sample_rep_phi():
     """Exercise the full Eq (47) sample-representative path (phi != 0)."""
     img = cube(16, 24, 24)
@@ -951,14 +1045,15 @@ if __name__ == "__main__":
                test_zero_band_limit_stays_lossless, test_param_validation,
                test_width_one_reduced_mode, test_low_dynamic_range,
                test_header_edge_cases, test_ndarray_error_limits,
-               test_out_of_range_samples_rejected,
+               test_out_of_range_samples_rejected, test_float_input_integrality,
+               test_truncated_stream,
                test_ccsds_header, test_hybrid_codec,
                test_numba_byte_identical, test_hybrid_numba_identical,
                test_package_imports_without_torch, test_metrics,
                test_bi_order, test_periodic_error_limits, test_hybrid_bi,
                test_bi_numba_identical, test_accumulator_init_table,
                test_band_varying_sample_rep, test_hybrid_sigma_init, test_output_word_size,
-               test_block_adaptive,
+               test_block_adaptive, test_block_adaptive_numba_identical,
                test_lossless_crop, test_reduced_mode,
                test_sample_rep_phi, test_sample_rep_psi, test_narrow_local_sums,
                test_column_local_sums, test_high_dynamic_range_and_signed,

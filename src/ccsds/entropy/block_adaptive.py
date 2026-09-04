@@ -8,8 +8,23 @@ splitting (k=0 is the fundamental sequence) and no compression.
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
+
+try:
+    from . import _block_adaptive_numba as _BN
+except Exception:
+    try:
+        import importlib.util as _ilu
+
+        _spec = _ilu.spec_from_file_location(
+            "_block_adaptive_numba",
+            os.path.join(os.path.dirname(__file__), "_block_adaptive_numba.py"))
+        _BN = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_BN)
+    except Exception:
+        _BN = None
 
 
 class BlockAdaptiveCoder:
@@ -23,6 +38,7 @@ class BlockAdaptiveCoder:
             self.max_k = -1 if dynamic_range <= 2 else 1
         else:
             self.max_k = 5 if dynamic_range <= 8 else (13 if dynamic_range <= 16 else 29)
+        self.use_numba = bool(_BN is not None and getattr(_BN, "NUMBA_OK", False))
 
     def _seg_start(self, num: int) -> bool:
         return (num % self.r) % self.SEG == 0
@@ -71,6 +87,8 @@ class BlockAdaptiveCoder:
                 bits.extend((int(s) >> (k - 1 - b)) & 1 for b in range(k))
 
     def encode(self, vals: np.ndarray) -> bytes:
+        if self.use_numba:                       # byte-identical fast path
+            return _BN.encode_numba(self, vals)
         J, ids = self.J, self.id_bits
         v = np.asarray(vals, np.int64)
         blocks = np.concatenate([v, np.zeros((-len(v)) % J, np.int64)]).reshape(-1, J)
@@ -100,6 +118,8 @@ class BlockAdaptiveCoder:
                      for p in range(0, len(bits), 8))
 
     def decode(self, body: bytes, n: int) -> np.ndarray:
+        if self.use_numba:                       # byte-identical fast path
+            return _BN.decode_numba(self, body, n)
         D, J, ids = self.D, self.J, self.id_bits
         fwd = np.unpackbits(np.frombuffer(body, np.uint8))
         pos = 0
@@ -171,7 +191,15 @@ if __name__ == "__main__":
                             v = rng.integers(0, 1 << D, n)
                             v[rng.random(n) < 0.8] = 0
                         v = v.astype(np.int64)
-                        assert np.array_equal(bc.decode(bc.encode(v), n), v), \
+                        blob = bc.encode(v)
+                        assert np.array_equal(bc.decode(blob, n), v), \
                             (D, J, r, restricted, dist)
+                        if bc.use_numba:         # numba must match pure byte-for-byte
+                            bc.use_numba = False
+                            assert bc.encode(v) == blob and \
+                                np.array_equal(bc.decode(blob, n), v), \
+                                (D, J, r, restricted, dist)
+                            bc.use_numba = True
                         t += 1
-    print(f"block-adaptive coder self-test OK ({t} round-trips)")
+    path = "numba + pure" if BlockAdaptiveCoder(16).use_numba else "pure"
+    print(f"block-adaptive coder self-test OK ({t} round-trips, {path})")

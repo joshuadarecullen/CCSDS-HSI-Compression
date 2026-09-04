@@ -86,12 +86,16 @@ def lossless_ratio(rows, datasets, out):
     def loss(d, coder):
         return next((r["ratio"] for r in rows if r["dataset"] == d
                      and r["entropy"] == coder and r["limit"] == 0), 0)
-    hy = [loss(d, "hybrid") for d in datasets]
-    sa = [loss(d, "sample_adaptive") for d in datasets]
+    bars = [("sample-adaptive", "sample_adaptive", "#7aa6c2"),
+            ("hybrid", "hybrid", "#d98c5f"),
+            ("block-adaptive", "block_adaptive", "#8fae7b")]
+    bars = [(lab, [loss(d, key) for d in datasets], c) for lab, key, c in bars]
+    bars = [b for b in bars if any(b[1])]
     x = np.arange(len(datasets))
+    w = 0.8 / len(bars)
     fig, ax = plt.subplots(figsize=(8.2, 4.8))
-    ax.bar(x - 0.2, sa, 0.4, label="sample-adaptive", color="#7aa6c2")
-    ax.bar(x + 0.2, hy, 0.4, label="hybrid", color="#d98c5f")
+    for i, (lab, vals, c) in enumerate(bars):
+        ax.bar(x + (i - (len(bars) - 1) / 2) * w, vals, w, label=lab, color=c)
     ax.set_xticks(x)
     ax.set_xticklabels([pretty(d) for d in datasets], rotation=35, ha="right", fontsize=8)
     ax.set_ylabel("lossless compression ratio (x:1)")
