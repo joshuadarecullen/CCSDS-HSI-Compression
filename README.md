@@ -33,7 +33,7 @@ recon = codec.decompress(codec.compress(img))
 assert np.abs(img - recon).max() <= 4
 ```
 
-Quality metrics for near-lossless reconstructions (numpy-only: PSNR, MSSIM, SAM):
+Quality metrics for near-lossless reconstructions (numpy: PSNR, MSSIM, SAM):
 
 ```python
 from ccsds import quality_report
@@ -89,7 +89,7 @@ reconstruction pass gradients unchanged.
 - **Three entropy coders**, in either encoding order: sample-adaptive (5.4.3.2,
   default; constant or per-band accumulator init), hybrid (5.4.3.3,
   `entropy_coder="hybrid"`) with the real annex-B low-entropy tables,
-  reverse-order suffix-free decoding and user-set initial accumulators, and
+  reverse-order suffix-free decoding and user set initial accumulators, and
   block-adaptive (5.4.3.4, the CCSDS-121 coder with basic or restricted options).
 - **Bit-exact CCSDS 5.3 header** (`io/ccsds_header.py`): packs/parses every supported
   parameter, including supplementary information tables (3.5), the user data byte
@@ -151,7 +151,7 @@ error limit of ~44 (every sample then within ±44 of the original).
 
 ## Benchmark
 
-Whole-cube results across 14 standard HSI scenes (`examples/benchmark.py`, all three
+Whole cube results across 14 standard HSI scenes (`examples/benchmark.py`, all three
 entropy coders). Each scene is the raw integer DN cube; near-lossless bounds the per sample
 error exactly by the limit, and PSNR is reported against each scene's data peak. The
 rate-distortion plots and the table below are the hybrid coder.
@@ -163,7 +163,7 @@ rate-distortion plots and the table below are the hybrid coder.
 ![Lossless ratio by dataset](assets/lossless_ratio.png)
 
 Lossless is **1.77-4.24:1** (median ~2:1). Near-lossless scales much further. Salinas reaches
-**54:1** at an error limit of 64. The hybrid coder ties sample adaptive when lossless but pulls
+**54:1** at an error limit of 64. The hybrid coder ties sample-adaptive when lossless but pulls
 well ahead as the limit grows (it packs the mostly-zero residuals into sub-1-bit codes).
 Block adaptive is the opposite trade: it edges ahead on 6 of the 14 scenes when lossless
 (ksc **3.52:1** against hybrid's 3.27) and slips to ~0.82x hybrid by an error limit of 64.
@@ -199,9 +199,6 @@ trade down into the 20s (urban_r162 25 dB at 0.32 bpppb). Salinas holds roughly 
 band. This sweep runs the hybrid coder out to an error limit of 512; the 10-bit urban
 scenes stop at 256 because the standard caps error limits at 2^min(D-1,16)-1 = 511
 (4.8.2.2), so a=512 is not representable in their headers and the benchmark skips it.
-
-Reproduce (reads `<dataset>/zarr/cube.zarr`, needs `zarr`; non-integer/normalised cubes are
-auto-skipped. Here `samson` was skipped as normalised and the 752M-sample `chikusei` by size):
 
 ```bash
 python3 examples/benchmark.py --root <data-dir> --out assets/benchmark_local.csv \
