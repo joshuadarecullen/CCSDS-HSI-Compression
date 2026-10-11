@@ -360,7 +360,13 @@ def _setup(codec):
     return spp, recon, cdiff, args
 
 
-def run_numba(codec, encode: bool, image=None, body=None):
+def _export_state(state, recon, spp):
+    """Hand the closed-loop arrays to the caller (see Ccsds123._run's `state`)."""
+    if state is not None:
+        state["reconstruction"], state["representatives"] = recon, spp
+
+
+def run_numba(codec, encode: bool, image=None, body=None, state=None):
     p = codec.p
     Nz, Ny, Nx, D = p.num_bands, p.height, p.width, p.dynamic_range
     spp, recon, cdiff, args = _setup(codec)
@@ -370,6 +376,7 @@ def run_numba(codec, encode: bool, image=None, body=None):
         buf = np.zeros((Nz * Ny * Nx * (p.u_max + D)) // 8 + 64, dtype=np.uint8)
         nbits = _kernel(1, 0, none_delta, img, np.zeros(1, np.uint8), 0,
                         buf, spp, recon, cdiff, *args)
+        _export_state(state, recon, spp)
         return bytes(buf[:(nbits + 7) // 8])
     nbits = 8 * len(body)
     body_arr = np.concatenate([np.frombuffer(body, dtype=np.uint8),
@@ -378,10 +385,11 @@ def run_numba(codec, encode: bool, image=None, body=None):
                   np.zeros(1, np.uint8), spp, recon, cdiff, *args)
     if pos < 0 or pos > nbits:
         raise IndexError("truncated body")
+    _export_state(state, recon, spp)
     return recon
 
 
-def run_numba_delta(codec, encode: bool, image=None, delta=None):
+def run_numba_delta(codec, encode: bool, image=None, delta=None, state=None):
     """Predictor-only numba pass for the hybrid coder (no entropy I/O):
     encode -> mapped-index array; decode -> reconstruction from a mapped-index array."""
     p = codec.p
@@ -393,10 +401,12 @@ def run_numba_delta(codec, encode: bool, image=None, delta=None):
         delta_arr = np.zeros((Nz, Ny, Nx), dtype=np.int64)
         _kernel(1, 1, delta_arr, img, np.zeros(1, np.uint8), 0,
                 dummy_buf, spp, recon, cdiff, *args)
+        _export_state(state, recon, spp)
         return delta_arr
     delta_arr = np.ascontiguousarray(delta, dtype=np.int64)
     _kernel(0, 2, delta_arr, np.zeros((1, 1, 1), np.int64), np.zeros(1, np.uint8), 0,
             dummy_buf, spp, recon, cdiff, *args)
+    _export_state(state, recon, spp)
     return recon
 
 

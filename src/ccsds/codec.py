@@ -98,24 +98,55 @@ class CCSDS123:
         nz, ny, nx = arr.shape
         return cls(num_bands=nz, height=ny, width=nx, **kwargs)
 
-    def compress(self, image) -> bytes:
+    def compress(self, image, state=None) -> bytes:
+        """Compress to a self-contained byte string. `state` (an optional dict) receives
+        "reconstruction" and "representatives"; see encode()."""
         arr = _to_numpy(image)
         if np.issubdtype(arr.dtype, np.floating):
             r = np.rint(arr)
             if not np.array_equal(r, arr):
                 raise ValueError("non-integer sample values; quantize before compressing")
             arr = r
-        return self.codec.compress(arr.astype(np.int64))
+        return self.codec.compress(arr.astype(np.int64), state=state)
 
-    def decompress(self, blob: bytes, as_torch: bool = False):
-        out = self.codec.decompress(blob)
+    def encode(self, image, as_torch: bool = False) -> dict:
+        """Compress and return the decoder-side state from the same predictor pass.
+
+        Returns {"bitstream": bytes, "reconstruction": s', "representatives": s''}, both
+        arrays [Z, Y, X] int64. s' is what decompress() returns. s'' are the sample
+        representatives (CCSDS 123.0-B-2 section 4.9): the values the predictor used as
+        neighbours, pulled from the reconstruction toward the prediction by the per-band
+        damping phi and offset psi at resolution theta. They equal s' when theta = 0,
+        when phi = psi = 0, and in lossless mode. The encoder tracks both in its closed
+        loop, so no decode is needed. as_torch=True returns the arrays as tensors.
+        """
+        state = {}
+        blob = self.compress(image, state=state)
+        out = {"bitstream": blob, **state}
         if as_torch:
             import torch
 
-            return torch.from_numpy(out)
+            out = {k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
+                   for k, v in out.items()}
         return out
 
+    def decompress(self, blob: bytes, as_torch: bool = False,
+                   return_representatives: bool = False):
+        """Decode to the [Z, Y, X] reconstruction. With return_representatives=True
+        returns (reconstruction, representatives); see encode() for what s'' is."""
+        state = {} if return_representatives else None
+        out = self.codec.decompress(blob, state=state)
+        rep = state["representatives"] if return_representatives else None
+        if as_torch:
+            import torch
+
+            out = torch.from_numpy(out)
+            rep = torch.from_numpy(rep) if rep is not None else None
+        return (out, rep) if return_representatives else out
+
     @staticmethod
-    def decompress_bytes(blob: bytes) -> np.ndarray:
+    def decompress_bytes(blob: bytes, return_representatives: bool = False):
         """Decode a byte string without already holding a configured codec."""
-        return Ccsds123.decompress_standalone(blob)
+        state = {} if return_representatives else None
+        out = Ccsds123.decompress_standalone(blob, state=state)
+        return (out, state["representatives"]) if return_representatives else out
