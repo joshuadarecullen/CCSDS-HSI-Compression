@@ -33,6 +33,21 @@ recon = codec.decompress(codec.compress(img))
 assert np.abs(img - recon).max() <= 4
 ```
 
+Sample representatives (4.9): in near-lossless mode the predictor does not run on the
+reconstruction `s'` but on `s''`, the reconstruction pulled toward the prediction by
+the per-band damping `phi` and offset `psi` at resolution `theta`. Both arrays come out
+of the encoder's closed loop in one pass, or from a real decode:
+
+```python
+codec = CCSDS123.from_image(img, absolute_error_limit=4, theta=4, phi=0, psi=2)
+enc = codec.encode(img)            # {"bitstream", "reconstruction", "representatives"}
+rec, rep = codec.decompress(enc["bitstream"], return_representatives=True)
+# rep == enc["representatives"]; rep == rec whenever theta == 0, phi == psi == 0, or lossless
+```
+
+`examples/sample_representatives.py` scores `s'` and `s''` against the original over a
+sweep of error limits and `phi`/`psi` (see "Evaluating quality").
+
 Quality metrics for near-lossless reconstructions (numpy: PSNR, MSSIM, SAM):
 
 ```python
@@ -70,7 +85,8 @@ m.codec_for(x.shape[-3:]).params            # the CodecParams in use
 ```
 
 `num_workers` spreads a batch over processes; `straight_through=True` makes the
-reconstruction pass gradients unchanged.
+reconstruction pass gradients unchanged; `return_representatives=True` adds
+`out["representatives"]` (the sample representatives `s''`, same shape/dtype/device).
 
 ## What it implements
 
@@ -122,6 +138,7 @@ tests/
 tools/extract_annexb_tables.py   regenerate annexb_tables.json from the standard text
 tools/crossval_ntnu.py           byte-level cross-validation vs the NTNU model
 examples/evaluate.py             compress a cube + report ratio / PSNR / MSSIM / SAM
+examples/sample_representatives.py  score s' vs s'' against the original over a phi/psi sweep
 ```
 
 ## Testing
@@ -148,6 +165,36 @@ python3 examples/evaluate.py --input cube.npy --peak data     # PSNR vs the data
 
 On Indian Pines, lossless is ~2.47:1; the hybrid coder reaches ~16:1 at an absolute
 error limit of ~44 (every sample then within ±44 of the original).
+
+`examples/sample_representatives.py` asks whether the sample representatives `s''` are
+a better estimate of the original than the reconstruction `s'`. For each error limit
+and each `(theta, phi, psi)` it reports the rate and, for both arrays, PSNR / SAM /
+max|err| against the original plus the fraction of samples where `s''` is closer:
+
+```bash
+python3 examples/sample_representatives.py                                   # Indian Pines if present
+python3 examples/sample_representatives.py --input cube.zarr --limits 2 8 32 --phi 0 1 2 4 --psi 0 1 2 4
+```
+
+Reads `.npy`, `.mat` (key auto-detected) and bare `[Y, X, Z]` zarr arrays. Note that
+`s''` is not bounded by the error limit once `phi > 0`: damping blends in the
+prediction, whose error can be far larger than the quantizer bin.
+
+On four AVIRIS / ROSIS / Hyperion scenes (Theta = 4, P = 3, sample-adaptive coder) the
+offset alone is what helps: `phi = 0` with `psi` between 2 and 8 makes `s''` closer to
+the original than `s'` at every error limit of 8 and above, and lowers the rate a
+little, while `phi > 0` is worse than the plain reconstruction at limits of 8 and
+below and never clearly beats offset-only.
+
+| scene | a = 8 | a = 32 | a = 128 |
+|---|---|---|---|
+| Indian Pines | +0.34 dB (psi 4), -1.3% rate | +0.67 dB (psi 8), -2.4% | +0.57 dB (psi 8), -0.8% |
+| Salinas | +0.68 dB (psi 8), -3.3% | +0.68 dB (psi 8), -1.4% | +0.16 dB (psi 4), -0.1% |
+| Pavia University | +0.18 dB (psi 2), -0.1% | +0.90 dB (psi 8), -2.1% | +0.67 dB (psi 8), -1.0% |
+| Botswana | +0.19 dB (psi 2), -0.3% | +0.53 dB (psi 4), -1.3% | +0.61 dB (psi 8), -1.0% |
+
+(PSNR gain of `s''` over `s'` against the original, best offset-only setting; `s''` then
+exceeds the error limit by up to `psi / 16 * a`.)
 
 ## Benchmark
 

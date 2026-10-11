@@ -10,6 +10,7 @@ numpy-only.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import List
 
 import numpy as np
@@ -823,11 +824,14 @@ class Ccsds123:
 
     # shared encode/decode loop
     def _run(self, encode: bool, image=None, body=None, collect_delta=False, delta_in=None,
-             period_abs=None, period_rel=None, u_period=0):
+             period_abs=None, period_rel=None, u_period=0, state=None):
         # collect_delta (encode) returns the mapped-index array instead of a body;
         # delta_in (decode) reconstructs from a mapped-index array. Both are used by the
         # hybrid and BI coders, whose entropy I/O is decoupled from the causal predictor.
         # period_abs/period_rel supply per-period error limits (4.8.2.4, pure-Python only).
+        # state: optional dict that receives the predictor's closed-loop arrays after the
+        # pass: "reconstruction" (s', Eq 48) and "representatives" (s'', 4.9). Encoder and
+        # decoder compute both identically, so the encoder can hand them out without a decode.
         hybrid_mode = collect_delta or (delta_in is not None)
         periodic = period_abs is not None
         # refresh the image-level fidelity flags so params mutated after
@@ -835,8 +839,8 @@ class Ccsds123:
         self._abs_used, self._rel_used = self.p.fidelity_layout()[:2]
         if self.use_numba and not periodic:                  # byte-identical fast path
             if not hybrid_mode:
-                return run_numba(self, encode, image, body)
-            return run_numba_delta(self, encode, image=image, delta=delta_in)
+                return run_numba(self, encode, image, body, state=state)
+            return run_numba_delta(self, encode, image=image, delta=delta_in, state=state)
         p = self.p
         Nz, Ny, Nx, D = p.num_bands, p.height, p.width, p.dynamic_range
         spp = np.zeros((Nz, Ny, Nx), dtype=np.int64)        # sample representatives s''
@@ -915,6 +919,8 @@ class Ccsds123:
                             sigma_acc = (sigma_acc + delta + 1) >> 1
                             gamma = (gamma + 1) >> 1
 
+        if state is not None:
+            state["reconstruction"], state["representatives"] = recon, spp
         if encode:
             return delta_out if collect_delta else writer.to_bytes()
         return recon
@@ -993,9 +999,16 @@ class Ccsds123:
             n += nper * ((p.num_bands if da else 1) * au + (p.num_bands if dr else 1) * ru)
         return n
 
-    def compress(self, image: np.ndarray) -> bytes:
-        """Compress a [Z, Y, X] integer image to a CCSDS-123 header + body byte string."""
+    def compress(self, image: np.ndarray, state=None) -> bytes:
+        """Compress a [Z, Y, X] integer image to a CCSDS-123 header + body byte string.
+
+        `state`, if a dict, is filled with the decoder-side arrays the encoder tracks
+        in its closed loop: "reconstruction" (s', what decompress() will return) and
+        "representatives" (s'', 4.9: the values the predictor used as neighbours;
+        equal to s' when phi = psi = 0 or in lossless mode). Both are [Z, Y, X] int64.
+        """
         p = self.p
+        run = partial(self._run, state=state)
         if image.shape != (p.num_bands, p.height, p.width):
             raise ValueError(f"image shape {image.shape} != {(p.num_bands, p.height, p.width)}")
         header = pack_header(p)                              # bit-exact CCSDS 5.3 header
@@ -1009,41 +1022,46 @@ class Ccsds123:
             M = (p.interleave_depth or p.num_bands) if p.encoding_order == "BI" else 0
             if p.periodic:
                 pa, pr, uu = self._period_arrays()
-                delta = self._run(encode=True, image=img, collect_delta=True,
-                                  period_abs=pa, period_rel=pr, u_period=uu)
+                delta = run(encode=True, image=img, collect_delta=True,
+                            period_abs=pa, period_rel=pr, u_period=uu)
                 body = self._hybrid().encode(delta, M, (uu, self._limit_layout(), pa, pr))
             else:
-                delta = self._run(encode=True, image=img, collect_delta=True)
+                delta = run(encode=True, image=img, collect_delta=True)
                 body = self._hybrid().encode(delta, M)
         elif p.entropy_coder == "block_adaptive":           # predictor -> input sequence -> 121 coder
             if p.periodic:
                 pa, pr, uu = self._period_arrays()
-                delta = self._run(encode=True, image=img, collect_delta=True,
-                                  period_abs=pa, period_rel=pr, u_period=uu)
+                delta = run(encode=True, image=img, collect_delta=True,
+                            period_abs=pa, period_rel=pr, u_period=uu)
                 seq = self._seq_pack(delta, pa, pr, uu)
             else:
-                delta = self._run(encode=True, image=img, collect_delta=True)
+                delta = run(encode=True, image=img, collect_delta=True)
                 seq = self._seq_pack(delta)
             body = self._block_adaptive().encode(seq)
         elif p.encoding_order == "BI":                      # predictor -> mapped indices -> BI coder
             if p.periodic:
                 pa, pr, u = self._period_arrays()
-                delta = self._run(encode=True, image=img, collect_delta=True,
-                                  period_abs=pa, period_rel=pr, u_period=u)
+                delta = run(encode=True, image=img, collect_delta=True,
+                            period_abs=pa, period_rel=pr, u_period=u)
                 body = self._encode_bi(delta, period_abs=pa, period_rel=pr, u=u)
             else:
-                delta = self._run(encode=True, image=img, collect_delta=True)
+                delta = run(encode=True, image=img, collect_delta=True)
                 body = self._encode_bi(delta)
         else:
-            body = self._run(encode=True, image=img)        # sample-adaptive, BSQ (interleaved)
+            body = run(encode=True, image=img)        # sample-adaptive, BSQ (interleaved)
         blob = header + body
         if len(blob) % p.output_word_size:                  # fill to the output word size (5.2.2)
             blob += bytes(p.output_word_size - len(blob) % p.output_word_size)
         return blob
 
-    def decompress(self, blob: bytes) -> np.ndarray:
-        """Decode a byte string produced by compress() back to the [Z, Y, X] image."""
+    def decompress(self, blob: bytes, state=None) -> np.ndarray:
+        """Decode a byte string produced by compress() back to the [Z, Y, X] image.
+
+        `state`, if a dict, is filled as in compress(): "reconstruction" (the returned
+        array) and "representatives" (the sample representatives s'', 4.9).
+        """
         p = self.p
+        run = partial(self._run, state=state)
         body = blob[parse_header(blob)[1]:]
         if p.entropy_coder == "hybrid":
             M = (p.interleave_depth or p.num_bands) if p.encoding_order == "BI" else 0
@@ -1052,30 +1070,30 @@ class Ccsds123:
                 pa0, _, uu = self._period_arrays()
                 delta, pa, pr = self._hybrid().decode(
                     body, shape, M, (uu, self._limit_layout(), len(pa0)))
-                return self._run(encode=False, delta_in=delta,
-                                 period_abs=pa, period_rel=pr, u_period=uu)
+                return run(encode=False, delta_in=delta,
+                           period_abs=pa, period_rel=pr, u_period=uu)
             delta = self._hybrid().decode(body, shape, M)
-            return self._run(encode=False, delta_in=delta)
+            return run(encode=False, delta_in=delta)
         if p.entropy_coder == "block_adaptive":
             vals = self._block_adaptive().decode(body, self._seq_len())
             delta, pa, pr = self._seq_unpack(vals)
             if pa is not None:
-                return self._run(encode=False, delta_in=delta, period_abs=pa,
-                                 period_rel=pr, u_period=p.update_period_exp)
-            return self._run(encode=False, delta_in=delta)
+                return run(encode=False, delta_in=delta, period_abs=pa,
+                           period_rel=pr, u_period=p.update_period_exp)
+            return run(encode=False, delta_in=delta)
         if p.encoding_order == "BI":
             delta, pa, pr, u = self._decode_bi(body)
             if pa is not None:
-                return self._run(encode=False, delta_in=delta,
-                                 period_abs=pa, period_rel=pr, u_period=u)
-            return self._run(encode=False, delta_in=delta)
-        return self._run(encode=False, body=body)
+                return run(encode=False, delta_in=delta,
+                           period_abs=pa, period_rel=pr, u_period=u)
+            return run(encode=False, delta_in=delta)
+        return run(encode=False, body=body)
 
     @staticmethod
-    def decompress_standalone(blob: bytes) -> np.ndarray:
+    def decompress_standalone(blob: bytes, state=None) -> np.ndarray:
         """Decode without already having a codec (rebuilds params from the CCSDS header)."""
         params, _ = parse_header(blob)
-        return Ccsds123(CodecParams(**params)).decompress(blob)
+        return Ccsds123(CodecParams(**params)).decompress(blob, state=state)
 
 
 if __name__ == "__main__":

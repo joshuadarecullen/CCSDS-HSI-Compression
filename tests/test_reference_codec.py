@@ -490,6 +490,26 @@ def test_torch_wrapper():
     err = (o["reconstruction"] - x).abs().max().item()
     assert 0 < err <= 3 and o["bitstreams"] != out["bitstreams"]
     assert torch.equal(m(x)["reconstruction"], x), "override must not stick"
+    # representatives: off by default, on request they ride along with the same
+    # shape/dtype/device, equal s' unless damping/offset are active, and match the
+    # static decode path
+    assert "representatives" not in out
+    mr = CCSDS123Module(dynamic_range=16, absolute_error_limit=3, theta=4, phi=8, psi=8,
+                        return_representatives=True)
+    orep = mr(x)
+    rep, rec = orep["representatives"], orep["reconstruction"]
+    assert rep.shape == rec.shape and rep.dtype == rec.dtype and rep.device == rec.device
+    assert not torch.equal(rep, rec)
+    dec_rec, dec_rep = CCSDS123Module.decompress(orep["bitstreams"], dtype=x.dtype,
+                                                 return_representatives=True)
+    assert torch.equal(dec_rec, rec) and torch.equal(dec_rep, rep)
+    assert mr(x[0])["representatives"].shape == x[0].shape
+    o0 = CCSDS123Module(dynamic_range=16, absolute_error_limit=3, return_representatives=True)(x)
+    assert torch.equal(o0["representatives"], o0["reconstruction"]), "Theta=0: s'' == s'"
+    mw = CCSDS123Module(dynamic_range=16, absolute_error_limit=3, theta=4, phi=8, psi=8,
+                        return_representatives=True, num_workers=2)     # worker-pool path too
+    ow = mw(x)
+    assert torch.equal(ow["representatives"], rep) and ow["bitstreams"] == orep["bitstreams"]
     assert m.codec_for((6, 16, 16), entropy_coder="hybrid").params.entropy_coder == "hybrid"
     o2 = m(x, entropy_coder="block_adaptive", block_size=16)
     assert torch.equal(o2["reconstruction"], x)
@@ -1027,6 +1047,97 @@ def test_lossless_region():
           f"({st['samples']} samples, enc={st['enc_s']:.1f}s dec={st['dec_s']:.1f}s)")
 
 
+def test_sample_representatives_exposed():
+    """`state` hands out the predictor's closed-loop arrays, s' and s'' (4.9), from
+    compress(), decompress() and decompress_standalone(), identically on the pure
+    and numba paths and for every coder / order. s'' == s' whenever the standard
+    says so (lossless, Theta = 0, or phi = psi = 0); otherwise it differs, and with
+    offset only (phi = 0) it stays inside the quantizer bin."""
+    img = cube(8, 12, 10)
+    base = dict(num_bands=8, height=12, width=10, dynamic_range=16, num_prediction_bands=3)
+    configs = [
+        dict(),                                                       # lossless
+        dict(absolute_error_limit=4),                                 # near-lossless, Theta=0
+        dict(absolute_error_limit=4, theta=3, phi=5, psi=6),
+        dict(absolute_error_limit=4, theta=4, phi=0, psi=15),         # offset only
+        dict(absolute_error_limit=2, theta=4, phi=15, psi=0, entropy_coder="block_adaptive"),
+        dict(relative_error_limit=64, theta=2, phi=3, psi=1, entropy_coder="hybrid"),
+        dict(absolute_error_limit=3, theta=2, phi=[z % 4 for z in range(8)], psi=1,
+             encoding_order="BI", interleave_depth=3),
+    ]
+    n_differ = 0
+    for kw in configs:
+        got = []
+        for use_numba in (True, False):
+            codec = Ccsds123(CodecParams(**base, **kw))
+            codec.use_numba = codec.use_numba and use_numba
+            enc, dec, sta = {}, {}, {}
+            blob = codec.compress(img, state=enc)
+            out = codec.decompress(blob, state=dec)
+            out2 = Ccsds123.decompress_standalone(blob, state=sta)
+            for st in (enc, dec, sta):
+                assert set(st) == {"reconstruction", "representatives"}, kw
+                assert st["reconstruction"].shape == img.shape == st["representatives"].shape
+                assert st["reconstruction"].dtype == np.int64 == st["representatives"].dtype
+                assert np.array_equal(st["reconstruction"], out), f"state recon != output {kw}"
+                assert np.array_equal(st["representatives"], enc["representatives"]), \
+                    f"encoder/decoder representatives differ {kw}"
+            assert np.array_equal(out, out2)
+            got.append((blob, enc["representatives"]))
+        assert got[0][0] == got[1][0] and np.array_equal(got[0][1], got[1][1]), \
+            f"numba vs pure representatives differ {kw}"
+        rep, rec = got[0][1], Ccsds123(CodecParams(**base, **kw)).decompress(got[0][0])
+        p = CodecParams(**base, **kw)
+        trivial = p.lossless or p.theta == 0 or (p.phi == 0 and p.psi == 0)
+        if trivial:
+            assert np.array_equal(rep, rec), f"s'' must equal s' for {kw}"
+            if p.lossless:
+                assert np.array_equal(rep, img)
+        else:
+            assert not np.array_equal(rep, rec), f"s'' must differ from s' for {kw}"
+            n_differ += 1
+            if p.phi == 0:                                   # offset only: |s'' - s'| <= m
+                assert int(np.abs(rep - rec).max()) <= p.absolute_error_limit
+        # plain calls still return exactly what they did before
+        assert codec.compress(img) == got[0][0]
+        assert np.array_equal(codec.decompress(got[0][0]), rec)
+    assert n_differ == 5
+    print(f"  state exposes s'/s'' on both paths, {len(configs)} configs ({n_differ} with s'' != s')")
+
+
+def test_frontend_representatives():
+    """CCSDS123.encode() returns the stream plus s'/s'' from one predictor pass, and
+    decompress(return_representatives=True) returns the same s'' after a real decode."""
+    import importlib
+    if REPO not in sys.path:
+        sys.path.insert(0, REPO)
+    pkg = importlib.import_module("src.ccsds")
+    img = cube(6, 16, 16)
+    codec = pkg.CCSDS123.from_image(img, absolute_error_limit=6, theta=4, phi=8, psi=8)
+    enc = codec.encode(img)
+    assert set(enc) == {"bitstream", "reconstruction", "representatives"}
+    assert enc["bitstream"] == codec.compress(img)
+    rec, rep = codec.decompress(enc["bitstream"], return_representatives=True)
+    assert np.array_equal(rec, codec.decompress(enc["bitstream"]))
+    assert np.array_equal(rec, enc["reconstruction"]) and np.array_equal(rep, enc["representatives"])
+    assert not np.array_equal(rep, rec), "phi/psi on: s'' must differ from s'"
+    rec2, rep2 = pkg.CCSDS123.decompress_bytes(enc["bitstream"], return_representatives=True)
+    assert np.array_equal(rec2, rec) and np.array_equal(rep2, rep)
+    assert int(np.abs(rec - img).max()) <= 6
+    # lossless: everything collapses to the input
+    ll = pkg.CCSDS123.from_image(img).encode(img)
+    assert np.array_equal(ll["reconstruction"], img) and np.array_equal(ll["representatives"], img)
+    try:
+        import torch
+        t = codec.encode(img, as_torch=True)
+        assert isinstance(t["representatives"], torch.Tensor) and isinstance(t["bitstream"], bytes)
+        r, q = codec.decompress(enc["bitstream"], as_torch=True, return_representatives=True)
+        assert torch.equal(q, t["representatives"]) and torch.equal(r, t["reconstruction"])
+    except ImportError:
+        pass
+    print("  CCSDS123.encode / decompress(return_representatives) consistent")
+
+
 def test_indian_pines_if_present():
     """Optional: real Indian Pines round-trip (only if the .mat is available locally)."""
     if not os.path.exists(INDIAN_PINES):
@@ -1061,6 +1172,7 @@ if __name__ == "__main__":
                test_band_dependent_error_limits, test_lossless_region,
                test_custom_weight_init, test_weight_exp_offset,
                test_supplementary_tables, test_torch_wrapper,
+               test_sample_representatives_exposed, test_frontend_representatives,
                test_indian_pines_if_present):
         print(f"\n[{fn.__name__}]")
         fn()
