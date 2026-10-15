@@ -2,8 +2,8 @@
 """Compress a hyperspectral cube and report compression ratio + PSNR / MSSIM / SAM.
 
 Runs the codec at lossless and a sweep of near-lossless absolute error limits and
-prints a quality table. With no --input it uses a local Indian Pines .mat if present,
-otherwise a synthetic cube, so it runs from a fresh clone.
+prints a quality table. With no --input it uses the Indian Pines .mat that
+CCSDS_INDIAN_PINES points at, otherwise a synthetic cube, so it runs from a fresh clone.
 
     python3 examples/evaluate.py
     python3 examples/evaluate.py --input cube.npy --limits 0 2 4 8 16
@@ -22,8 +22,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 from src.ccsds import Ccsds123, CodecParams, quality_report   # noqa: E402
 
-INDIAN_PINES = ("/home/joshua/Documents/phd_university/code/deepdynamichsicompression"
-                "/data/indian_pines/mat/indian_pines.mat")
+INDIAN_PINES = os.environ.get("CCSDS_INDIAN_PINES", "")
 
 
 def load_cube(args):
@@ -52,7 +51,7 @@ def load_cube(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input", help="input cube (.npy or .mat); default: Indian Pines or synthetic")
+    ap.add_argument("--input", help="input cube (.npy or .mat); default: $CCSDS_INDIAN_PINES or synthetic")
     ap.add_argument("--mat-key", default="indian_pines", help="variable name inside a .mat file")
     ap.add_argument("--transpose", help="axis order to apply, e.g. 2,0,1 to make (Z,Y,X)")
     ap.add_argument("--limits", type=int, nargs="+", default=[0, 2, 4, 8, 16],

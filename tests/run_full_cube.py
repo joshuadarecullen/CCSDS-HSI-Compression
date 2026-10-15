@@ -1,6 +1,6 @@
 """Headline full-cube run, lossless, through the real bitstream.
 
-Uses real Indian Pines (145x145x220) if the .mat is available locally, otherwise
+Uses real Indian Pines (145x145x220) if CCSDS_INDIAN_PINES points at the .mat, otherwise
 a synthetic cube of the same size, so this runs from a fresh clone. With numba
 installed it finishes in ~1 s each way; pure-Python takes a couple of minutes.
 """
@@ -20,8 +20,7 @@ rc = importlib.util.module_from_spec(spec)
 sys.modules["reference_codec"] = rc
 spec.loader.exec_module(rc)
 
-MAT = ("/home/joshua/Documents/phd_university/code/deepdynamichsicompression"
-       "/data/indian_pines/mat/indian_pines.mat")
+MAT = os.environ.get("CCSDS_INDIAN_PINES", "")
 if os.path.exists(MAT):
     import scipy.io as sio
     img = np.transpose(sio.loadmat(MAT)["indian_pines"], (2, 0, 1)).astype(np.int64)

@@ -149,8 +149,8 @@ python3 tests/run_full_cube.py            # full 145×145×220-size cube
 ```
 
 The suite runs on a deterministic synthetic cube, so it works from a fresh clone with
-only numpy. If a local Indian Pines `.mat` is found it is exercised too (lossless,
-~2.49:1).
+only numpy. Set `CCSDS_INDIAN_PINES=/path/to/indian_pines.mat` to also exercise real
+Indian Pines (lossless, ~2.49:1).
 
 ## Evaluating quality
 
@@ -158,7 +158,7 @@ only numpy. If a local Indian Pines `.mat` is found it is exercised too (lossles
 limits and prints compression ratio with PSNR / MSSIM / SAM:
 
 ```bash
-python3 examples/evaluate.py                                  # Indian Pines if present, else synthetic
+python3 examples/evaluate.py                                  # $CCSDS_INDIAN_PINES if set, else synthetic
 python3 examples/evaluate.py --entropy hybrid --limits 0 8 16 32 64
 python3 examples/evaluate.py --input cube.npy --peak data     # PSNR vs the data's actual peak
 ```
@@ -172,7 +172,7 @@ and each `(theta, phi, psi)` it reports the rate and, for both arrays, PSNR / SA
 max|err| against the original plus the fraction of samples where `s''` is closer:
 
 ```bash
-python3 examples/sample_representatives.py                                   # Indian Pines if present
+python3 examples/sample_representatives.py                                   # $CCSDS_INDIAN_PINES if set
 python3 examples/sample_representatives.py --input cube.zarr --limits 2 8 32 --phi 0 1 2 4 --psi 0 1 2 4
 ```
 

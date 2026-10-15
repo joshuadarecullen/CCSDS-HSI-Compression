@@ -10,8 +10,8 @@ Cubes whose values are not integer (e.g. normalised to [0, 1]) are skipped -- lo
 integer compression does not apply to them. Negative integers are shifted to a
 non-negative range (lossless, and the quality metrics are shift-invariant).
 
-    python3 examples/benchmark.py --root /srv/data/ml/datasets --out results.csv
-    python3 examples/benchmark.py --root ../deepdynamichsicompression/data \
+    python3 examples/benchmark.py --root path/to/data --out results.csv
+    python3 examples/benchmark.py --root path/to/data \
         --datasets indian_pines pavia_university --coders hybrid --limits 0 4 16
 """
 import argparse
