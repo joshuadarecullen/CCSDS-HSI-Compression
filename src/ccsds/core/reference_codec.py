@@ -63,6 +63,13 @@ def _clip(v: int, lo: int, hi: int) -> int:
     return v
 
 
+def plane_dtype(dynamic_range: int) -> type:
+    """Storage type of the full-cube arrays (samples, s', s'', cached central local differences,
+    mapped indices): int32 while every value fits, i.e. D <= 29 (|4 s'' - sigma| < 2^(D+2)),
+    else int64. Arithmetic is always 64-bit (numba) or Python integers."""
+    return np.int32 if dynamic_range <= 29 else np.int64
+
+
 def _mod_star(x: int, R: int) -> int:
     """mod*_R[x]: the representative of x mod 2^R lying in [-2^(R-1), 2^(R-1)). (4.7.2)"""
     half = 1 << (R - 1)
@@ -455,6 +462,7 @@ class Ccsds123:
             self.s_min = 0
             self.s_max = (1 << D) - 1
             self.s_mid = 1 << (D - 1)
+        self.plane_dtype = plane_dtype(D)                    # full-cube array storage
         self.w_min = -(1 << (params.omega + 2))             # Eq (30)
         self.w_max = (1 << (params.omega + 2)) - 1
         # image-level fidelity mode (4.8.2.1): which limit types are in use
@@ -795,7 +803,7 @@ class Ccsds123:
         G, resc = self._gamma_seq(Ny * Nx)
         sigma = [self._sigma_init(z) for z in range(Nz)]
         r = BitReader(body)
-        delta = np.zeros((Nz, Ny, Nx), dtype=np.int64)
+        delta = np.zeros((Nz, Ny, Nx), dtype=self.plane_dtype)
         periodic = p.periodic
         if periodic:
             period_abs, period_rel, u = self._period_arrays()
@@ -843,10 +851,10 @@ class Ccsds123:
             return run_numba_delta(self, encode, image=image, delta=delta_in, state=state)
         p = self.p
         Nz, Ny, Nx, D = p.num_bands, p.height, p.width, p.dynamic_range
-        spp = np.zeros((Nz, Ny, Nx), dtype=np.int64)        # sample representatives s''
-        recon = np.zeros((Nz, Ny, Nx), dtype=np.int64)      # reconstructed samples s'
-        cdiff = np.zeros((Nz, Ny, Nx), dtype=np.int64)      # cached central local differences
-        delta_out = np.zeros((Nz, Ny, Nx), dtype=np.int64) if collect_delta else None
+        spp = np.zeros((Nz, Ny, Nx), dtype=self.plane_dtype)        # sample representatives s''
+        recon = np.zeros((Nz, Ny, Nx), dtype=self.plane_dtype)      # reconstructed samples s'
+        cdiff = np.zeros((Nz, Ny, Nx), dtype=self.plane_dtype)      # cached central local differences
+        delta_out = np.zeros((Nz, Ny, Nx), dtype=self.plane_dtype) if collect_delta else None
         gstar_full = (1 << p.gamma_star) - 1
 
         writer = BitWriter() if (encode and not collect_delta) else None
@@ -953,9 +961,9 @@ class Ccsds123:
         p = self.p
         Nz, Ny, Nx = p.num_bands, p.height, p.width
         if p.encoding_order != "BI":
-            return vals.reshape(Nz, Ny, Nx).copy(), None, None
+            return vals.reshape(Nz, Ny, Nx).astype(self.plane_dtype), None, None
         M, n_i = self._bi_blocks()
-        delta = np.zeros((Nz, Ny, Nx), np.int64)
+        delta = np.zeros((Nz, Ny, Nx), self.plane_dtype)
         got_a = got_r = None
         if p.periodic:
             pa0, pr0, u = self._period_arrays()
@@ -1005,19 +1013,20 @@ class Ccsds123:
         `state`, if a dict, is filled with the decoder-side arrays the encoder tracks
         in its closed loop: "reconstruction" (s', what decompress() will return) and
         "representatives" (s'', 4.9: the values the predictor used as neighbours;
-        equal to s' when phi = psi = 0 or in lossless mode). Both are [Z, Y, X] int64.
+        equal to s' when phi = psi = 0 or in lossless mode). Both are [Z, Y, X] arrays of
+        `plane_dtype` (int32 for D <= 29, else int64), as is decompress()'s output.
         """
         p = self.p
         run = partial(self._run, state=state)
         if image.shape != (p.num_bands, p.height, p.width):
             raise ValueError(f"image shape {image.shape} != {(p.num_bands, p.height, p.width)}")
         header = pack_header(p)                              # bit-exact CCSDS 5.3 header
-        img = image.astype(np.int64)
-        lo, hi = int(img.min()), int(img.max())
+        lo, hi = int(image.min()), int(image.max())          # checked before narrowing
         if lo < self.s_min or hi > self.s_max:
             raise ValueError(
                 f"sample values span [{lo}, {hi}], outside [{self.s_min}, {self.s_max}] "
                 f"for dynamic_range={p.dynamic_range}, signed={p.signed}")
+        img = image.astype(self.plane_dtype, copy=False)
         if p.entropy_coder == "hybrid":                     # predictor -> mapped indices -> hybrid
             M = (p.interleave_depth or p.num_bands) if p.encoding_order == "BI" else 0
             if p.periodic:
