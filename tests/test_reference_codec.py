@@ -3,7 +3,8 @@ End-to-end tests for the CCSDS-123.0-B-2 reference codec.
 
 Runs on a deterministic synthetic cube (synthetic_hsi.py) so the suite needs no
 data files; every check goes through the real compressed bitstream
-(compress -> bytes -> decompress). Uses a local Indian Pines .mat too if present.
+(compress -> bytes -> decompress). Set CCSDS_INDIAN_PINES to a local
+indian_pines.mat to also round-trip real data.
 
     python3 tests/test_reference_codec.py
 """
@@ -35,9 +36,8 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 from synthetic_hsi import make_synthetic_hsi   # noqa: E402
 
-# Optional real-data path (local only; not required for the suite to pass).
-INDIAN_PINES = ("/home/joshua/Documents/phd_university/code/deepdynamichsicompression"
-                "/data/indian_pines/mat/indian_pines.mat")
+# Optional real-data path from the environment (not required for the suite to pass).
+INDIAN_PINES = os.environ.get("CCSDS_INDIAN_PINES", "")
 
 
 def _load_codec_module():
@@ -1141,7 +1141,7 @@ def test_frontend_representatives():
 def test_indian_pines_if_present():
     """Optional: real Indian Pines round-trip (only if the .mat is available locally)."""
     if not os.path.exists(INDIAN_PINES):
-        _skip("Indian Pines .mat not present (synthetic covers CI)")
+        _skip("CCSDS_INDIAN_PINES not set to an Indian Pines .mat (synthetic covers CI)")
         return
     import scipy.io as sio
     img = np.transpose(sio.loadmat(INDIAN_PINES)["indian_pines"], (2, 0, 1)).astype(np.int64)

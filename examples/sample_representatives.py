@@ -13,7 +13,7 @@ is reported too, since phi/psi also change the bitstream.
 A positive "psnr_gain" column means the representatives are the better input for a
 downstream model fed from the codec (denoised, compressed-domain input).
 
-    python3 examples/sample_representatives.py                       # Indian Pines or synthetic
+    python3 examples/sample_representatives.py                       # $CCSDS_INDIAN_PINES or synthetic
     python3 examples/sample_representatives.py --input scene.mat     # .mat key auto-detected
     python3 examples/sample_representatives.py --input cube.zarr     # bare [Y, X, Z] zarr array
     python3 examples/sample_representatives.py --limits 2 8 32 --theta 4 --phi 0 8 15 --psi 0 8 15
@@ -32,12 +32,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 from src.ccsds import CCSDS123, calculate_psnr, calculate_spectral_angle   # noqa: E402
 
-# local real-data defaults (sibling research repo); the first that exists is used
-_DATA = os.path.join(os.path.dirname(REPO), "deepdynamichsicompression", "data")
-DEFAULT_INPUTS = [
-    os.path.join(_DATA, "indian_pines", "zarr", "cube_v2_purr.zarr"),
-    os.path.join(_DATA, "indianpines", "Indian_pines.mat"),
-]
+# optional real-data default from the environment (any format load_cube reads)
+DEFAULT_INPUT = os.environ.get("CCSDS_INDIAN_PINES", "")
 
 
 def load_cube(path, mat_key=None, transpose=None):
@@ -117,8 +113,8 @@ def run(cube, limit, theta, phi, psi, dynamic_range, peak, codec_kwargs):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input", help="cube (.npy/.npz/.mat); default: Indian Pines if found, "
-                                    "else synthetic")
+    ap.add_argument("--input", help="cube (.npy/.npz/.mat/.zarr); default: $CCSDS_INDIAN_PINES "
+                                    "if set, else synthetic")
     ap.add_argument("--mat-key", help="variable name inside a .mat/.npz (default: auto)")
     ap.add_argument("--transpose", help="axis order to apply, e.g. 2,0,1 (default for .mat)")
     ap.add_argument("--crop", type=int, nargs=4, metavar=("Y0", "Y1", "X0", "X1"),
@@ -143,7 +139,7 @@ def main():
     ap.add_argument("--width", type=int, default=96, help="synthetic-fallback width")
     args = ap.parse_args()
 
-    path = args.input or next((p for p in DEFAULT_INPUTS if os.path.exists(p)), None)
+    path = args.input or (DEFAULT_INPUT if os.path.exists(DEFAULT_INPUT) else None)
     if path:
         tr = tuple(int(i) for i in args.transpose.split(",")) if args.transpose else None
         cube, label = load_cube(path, args.mat_key, tr), os.path.basename(path)
