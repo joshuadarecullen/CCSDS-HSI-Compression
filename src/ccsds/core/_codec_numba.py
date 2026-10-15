@@ -4,7 +4,8 @@ Numba port of `Ccsds123._run`, byte-identical to the pure-Python reference
 installed and the config is int64-safe, otherwise the pure-Python path runs.
 
 All arithmetic is int64; mod*_R is applied only when R<=62 (for the default R=64
-it is the identity).
+it is the identity). The full-cube arrays are stored as `Ccsds123.plane_dtype` (int32 in
+the numba regime, D <= 24): every element read enters int64 arithmetic.
 """
 
 from __future__ import annotations
@@ -335,9 +336,9 @@ def numba_safe(p) -> bool:
 def _setup(codec):
     p = codec.p
     Nz, Ny, Nx, D = p.num_bands, p.height, p.width, p.dynamic_range
-    spp = np.zeros((Nz, Ny, Nx), dtype=np.int64)
-    recon = np.zeros((Nz, Ny, Nx), dtype=np.int64)
-    cdiff = np.zeros((Nz, Ny, Nx), dtype=np.int64)
+    spp = np.zeros((Nz, Ny, Nx), dtype=codec.plane_dtype)
+    recon = np.zeros((Nz, Ny, Nx), dtype=codec.plane_dtype)
+    cdiff = np.zeros((Nz, Ny, Nx), dtype=codec.plane_dtype)
     abs_lim = _limit_array(p.absolute_error_limit, Nz)
     rel_lim = _limit_array(p.relative_error_limit, Nz)
     sigma_init = np.array([codec._sigma_init(z) for z in range(Nz)], dtype=np.int64)
@@ -370,9 +371,9 @@ def run_numba(codec, encode: bool, image=None, body=None, state=None):
     p = codec.p
     Nz, Ny, Nx, D = p.num_bands, p.height, p.width, p.dynamic_range
     spp, recon, cdiff, args = _setup(codec)
-    none_delta = np.zeros((1, 1, 1), dtype=np.int64)
+    none_delta = np.zeros((1, 1, 1), dtype=codec.plane_dtype)
     if encode:
-        img = np.ascontiguousarray(image, dtype=np.int64)
+        img = np.ascontiguousarray(image, dtype=codec.plane_dtype)
         buf = np.zeros((Nz * Ny * Nx * (p.u_max + D)) // 8 + 64, dtype=np.uint8)
         nbits = _kernel(1, 0, none_delta, img, np.zeros(1, np.uint8), 0,
                         buf, spp, recon, cdiff, *args)
@@ -381,7 +382,7 @@ def run_numba(codec, encode: bool, image=None, body=None, state=None):
     nbits = 8 * len(body)
     body_arr = np.concatenate([np.frombuffer(body, dtype=np.uint8),
                                np.full(64, 0xFF, np.uint8)])   # bounds one sample's overrun
-    pos = _kernel(0, 0, none_delta, np.zeros((1, 1, 1), np.int64), body_arr, nbits,
+    pos = _kernel(0, 0, none_delta, np.zeros((1, 1, 1), codec.plane_dtype), body_arr, nbits,
                   np.zeros(1, np.uint8), spp, recon, cdiff, *args)
     if pos < 0 or pos > nbits:
         raise IndexError("truncated body")
@@ -397,14 +398,14 @@ def run_numba_delta(codec, encode: bool, image=None, delta=None, state=None):
     spp, recon, cdiff, args = _setup(codec)
     dummy_buf = np.zeros(1, dtype=np.uint8)
     if encode:
-        img = np.ascontiguousarray(image, dtype=np.int64)
-        delta_arr = np.zeros((Nz, Ny, Nx), dtype=np.int64)
+        img = np.ascontiguousarray(image, dtype=codec.plane_dtype)
+        delta_arr = np.zeros((Nz, Ny, Nx), dtype=codec.plane_dtype)
         _kernel(1, 1, delta_arr, img, np.zeros(1, np.uint8), 0,
                 dummy_buf, spp, recon, cdiff, *args)
         _export_state(state, recon, spp)
         return delta_arr
-    delta_arr = np.ascontiguousarray(delta, dtype=np.int64)
-    _kernel(0, 2, delta_arr, np.zeros((1, 1, 1), np.int64), np.zeros(1, np.uint8), 0,
+    delta_arr = np.ascontiguousarray(delta)                 # as the entropy decoder gave it
+    _kernel(0, 2, delta_arr, np.zeros((1, 1, 1), codec.plane_dtype), np.zeros(1, np.uint8), 0,
             dummy_buf, spp, recon, cdiff, *args)
     _export_state(state, recon, spp)
     return recon

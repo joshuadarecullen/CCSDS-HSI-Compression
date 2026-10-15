@@ -107,13 +107,13 @@ class CCSDS123:
             if not np.array_equal(r, arr):
                 raise ValueError("non-integer sample values; quantize before compressing")
             arr = r
-        return self.codec.compress(arr.astype(np.int64), state=state)
+        return self.codec.compress(arr, state=state)       # range-checked, then stored as plane_dtype
 
     def encode(self, image, as_torch: bool = False) -> dict:
         """Compress and return the decoder-side state from the same predictor pass.
 
         Returns {"bitstream": bytes, "reconstruction": s', "representatives": s''}, both
-        arrays [Z, Y, X] int64. s' is what decompress() returns. s'' are the sample
+        [Z, Y, X] integer arrays (int32 for D <= 29, else int64). s' is what decompress() returns. s'' are the sample
         representatives (CCSDS 123.0-B-2 section 4.9): the values the predictor used as
         neighbours, pulled from the reconstruction toward the prediction by the per-band
         damping phi and offset psi at resolution theta. They equal s' when theta = 0,

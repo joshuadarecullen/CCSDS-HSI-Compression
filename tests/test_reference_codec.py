@@ -1078,7 +1078,7 @@ def test_sample_representatives_exposed():
             for st in (enc, dec, sta):
                 assert set(st) == {"reconstruction", "representatives"}, kw
                 assert st["reconstruction"].shape == img.shape == st["representatives"].shape
-                assert st["reconstruction"].dtype == np.int64 == st["representatives"].dtype
+                assert st["reconstruction"].dtype == codec.plane_dtype == st["representatives"].dtype
                 assert np.array_equal(st["reconstruction"], out), f"state recon != output {kw}"
                 assert np.array_equal(st["representatives"], enc["representatives"]), \
                     f"encoder/decoder representatives differ {kw}"
@@ -1177,3 +1177,22 @@ if __name__ == "__main__":
         print(f"\n[{fn.__name__}]")
         fn()
     print("\nALL TESTS PASSED")
+
+
+def test_int32_planes_give_the_int64_streams_and_reconstructions():
+    """The full-cube arrays stored as int32 (D <= 29) change no bit of the stream or the decode."""
+    rng = np.random.default_rng(7)
+    cases = ((16, {}), (16, {"absolute_error_limit": 9, "theta": 4, "phi": 3, "psi": 8}),
+             (16, {"encoding_order": "BI"}), (24, {"absolute_error_limit": 3}), (29, {"absolute_error_limit": 5}))
+    for D, kw in cases:
+        img = rng.integers(0, 1 << D, size=(5, 9, 11)).astype(np.int64)
+        img[:, :2] = (1 << D) - 1                                   # saturated rows: the largest local sums
+        for coder in ("sample_adaptive", "hybrid", "block_adaptive"):
+            got = []
+            for dtype in (np.int32, np.int64):
+                codec = Ccsds123(CodecParams(num_bands=5, height=9, width=11, dynamic_range=D,
+                                             entropy_coder=coder, **kw))
+                codec.plane_dtype = dtype
+                blob = codec.compress(img)
+                got.append((blob, codec.decompress(blob)))
+            assert got[0][0] == got[1][0] and np.array_equal(got[0][1], got[1][1]), (D, kw, coder)
